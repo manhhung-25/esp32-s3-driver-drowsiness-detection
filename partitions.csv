@@ -1,0 +1,14 @@
+# Name,   Type, SubType, Offset,   Size, Flags
+# Note: N16R8 = 16MB flash. Các model .espdl được NHÚNG vào app (RODATA)
+# nên mỗi app partition (ota_0/ota_1) phải đủ lớn: face detect ~480KB + PFLD ~1.5MB.
+#
+# Layout OTA (bật được cập nhật firmware qua app):
+#   otadata : quản lý slot đang chạy (do bootloader đọc)
+#   ota_0   : app slot A (~3.75MB — đủ code + model RODATA)
+#   ota_1   : app slot B (cùng size, để OTA lật qua lại)
+# Còn lại ~7.9MB flash trống (có thể thêm spiffs sau nếu cần).
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+otadata,  data, ota,     0x10000, 0x2000,
+ota_0,    app,  ota_0,   0x20000, 0x3C0000,
+ota_1,    app,  ota_1,   0x3E0000, 0x3C0000,

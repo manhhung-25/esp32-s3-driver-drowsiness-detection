@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin - Drowsy Monitor</title>
+<style>
+  body { background:#101418; color:#ddd; font-family: monospace; margin:16px; }
+  h2 { color:#ffb74d; }
+  .box { background:#1b2128; border:1px solid #333; border-radius:6px; padding:12px; margin:10px 0; max-width:560px; }
+  label { display:inline-block; width:230px; }
+  input { background:#222; color:#eee; border:1px solid #444; padding:4px 6px; width:180px; }
+  .btn { background:#ef6c00; color:#fff; border:0; padding:8px 14px; border-radius:4px; cursor:pointer; margin:4px; }
+  .btn2 { background:#37474f; }
+  .danger { background:#c62828; }
+  #msg { color:#4caf50; }
+</style>
+</head>
+<body>
+<h2>&#128295; Quản trị thiết bị - Drowsy Monitor</h2>
+<div class="box">
+  <p>Mật khẩu admin: <input id="pass" type="password" value=""><button class="btn2" onclick="load()">&#128274; Đăng nhập / Tải cấu hình</button></p>
+  <p id="msg"></p>
+</div>
+<div class="box">
+  <h3>Cấu hình thiết bị</h3>
+  <p><label>Tên thiết bị</label><input id="device_name"></p>
+  <p><label>Tài xế (driver_name)</label><input id="driver_name"></p>
+  <p><label>Địa chỉ (location)</label><input id="location"></p>
+  <p><label>EAR blink (x1000, 200=0.2)</label><input id="ear_blink_th"></p>
+  <p><label>EAR drowsy (x1000)</label><input id="ear_drowsy_th"></p>
+  <p><label>MAR ngáp (x1000)</label><input id="mar_th"></p>
+  <p><label>PERCLOS (x1000, 400=40%)</label><input id="perclos_th"></p>
+  <p><label>Pitch dev (x1000)</label><input id="pitch_dev_th"></p>
+  <p><label>Microsleep (ms)</label><input id="microsleep_ms"></p>
+  <p><label>Cửa sổ PERCLOS (ms)</label><input id="window_ms"></p>
+  <p><label>Blink rate cao (nhịp/phút)</label><input id="blink_rate_high"></p>
+  <p><button class="btn" onclick="save()">&#128190; Lưu + áp dụng</button>
+     <button class="btn2" onclick="saveReboot()">&#128260; Lưu + Reboot</button>
+     <button class="btn danger" onclick="doReboot()">&#128260; Reboot (không lưu)</button></p>
+</div>
+<div class="box">
+  <h3>Log gần nhất</h3>
+  <pre id="log" style="max-height:200px;overflow:auto;font-size:12px;"></pre>
+  <button class="btn2" onclick="loadLog()">Tải log</button>
+</div>
+<script>
+let P = '';
+function q(name, val){ return encodeURIComponent(name) + '=' + encodeURIComponent(val); }
+async function get(url){ try { const r = await fetch(url); return await r.text(); } catch(e){ return ''; } }
+async function load(){
+  P = document.getElementById('pass').value;
+  const t = await get('/admin/api/config?' + q('pass', P));
+  document.getElementById('msg').innerText = t;
+  try {
+    const j = JSON.parse(t);
+    for (const k in j) { const el = document.getElementById(k); if (el) el.value = j[k]; }
+    document.getElementById('msg').innerText = 'Đã tải cấu hình.';
+  } catch(e){ document.getElementById('msg').innerText = 'Lỗi đăng nhập / đọc cấu hình: ' + t; }
+}
+async function save(){
+  let u = '/admin/api/config?' + q('pass', P);
+  const keys = ['device_name','driver_name','location','ear_blink_th','ear_drowsy_th',
+                'mar_th','perclos_th','pitch_dev_th','microsleep_ms','window_ms','blink_rate_high'];
+  for (const k of keys){ const el = document.getElementById(k); if (el) u += '&' + q(k, el.value); }
+  document.getElementById('msg').innerText = await get(u);
+}
+async function saveReboot(){ await save(); doReboot(); }
+async function doReboot(){ await get('/admin/api/reboot?' + q('pass', P)); }
+async function loadLog(){
+  const t = await get('/admin/api/log?' + q('pass', P));
+  document.getElementById('log').innerText = t;
+}
+loadLog();
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+# ===== Driver Drowsiness Detection - cấu hình riêng ESP32-S3 =====
+
+# ---- CPU 240MHz ----
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+
+# ---- Octal PSRAM 8MB (N16R8): BẮT BUỘC OCT + 80M ----
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# ---- Cache dữ liệu 64KB / 8-way / line 64B: tăng tốc inference trên PSRAM ----
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_8WAYS=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y

@@ -1,0 +1,399 @@
+# ============================================================================
+# Kconfig.projbuild - Driver Drowsiness Detection
+# Toàn bộ tham số có thể chỉnh trong `idf.py menuconfig` mà không cần sửa code.
+# Ngoài ra có thể chỉnh ngưỡng runtime qua console: `drowsy set <tên> <giá trị>`
+#
+# LƯU Ý (IDF 5.3): Kconfig.projbuild chỉ được nạp khi nằm TRONG component.
+# -> File này PHẢI đặt tại main/Kconfig.projbuild (main luôn được build).
+# File Kconfig.projbuild ở gốc project sẽ bị IDF BỎ QUA.
+# ============================================================================
+
+menu "Drowsiness Detection Configuration"
+
+    # ----------------------------------------------------------
+    # Camera pinout
+    # LƯU Ý: esp32-camera v2.1.x ĐÃ GỠ BỎ option CONFIG_CAMERA_MODULE_*
+    # nên project tự định nghĩa pin riêng và gán trực tiếp vào camera_config_t.
+    # ----------------------------------------------------------
+    choice DROWSY_CAM_MODULE
+        prompt "Camera board preset"
+        default DROWSY_CAM_MODULE_ESP32_S3_EYE
+        help
+            Chọn preset chân cắm camera hoặc tự khai báo (CUSTOM).
+            Các preset sau sẽ tự nạp pin mặc định (không cần khai báo thêm).
+
+    config DROWSY_CAM_MODULE_ESP32_S3_EYE
+        bool "ESP32-S3-EYE (OV2640)"
+        help
+            Pins mặc định của board ESP32-S3-EYE.
+
+    config DROWSY_CAM_MODULE_AI_THINKER
+        bool "AI-Thinker ESP32-CAM (OV2640)"
+        help
+            Pins mặc định của board AI-Thinker ESP32-CAM.
+
+    config DROWSY_CAM_MODULE_CUSTOM
+        bool "Custom board (tự khai báo pin bên dưới)"
+        help
+            Tự khai báo toàn bộ chân cắm camera bằng các option DROWSY_CAM_PIN_*.
+
+    endchoice
+
+    # ---- Pins cho board CUSTOM (chỉ dùng khi chọn Custom board) ----
+    config DROWSY_CAM_PIN_PWDN
+        int "Camera PWDN pin (custom)"
+        default -1
+    config DROWSY_CAM_PIN_RESET
+        int "Camera RESET pin (custom)"
+        default -1
+    config DROWSY_CAM_PIN_XCLK
+        int "Camera XCLK pin (custom)"
+        default 15
+    config DROWSY_CAM_PIN_SIOD
+        int "Camera SIOD (SDA) pin (custom)"
+        default 4
+    config DROWSY_CAM_PIN_SIOC
+        int "Camera SIOC (SCL) pin (custom)"
+        default 5
+    config DROWSY_CAM_PIN_Y9
+        int "Camera D7 (Y9) pin (custom)"
+        default 16
+    config DROWSY_CAM_PIN_Y8
+        int "Camera D6 (Y8) pin (custom)"
+        default 17
+    config DROWSY_CAM_PIN_Y7
+        int "Camera D5 (Y7) pin (custom)"
+        default 18
+    config DROWSY_CAM_PIN_Y6
+        int "Camera D4 (Y6) pin (custom)"
+        default 12
+    config DROWSY_CAM_PIN_Y5
+        int "Camera D3 (Y5) pin (custom)"
+        default 10
+    config DROWSY_CAM_PIN_Y4
+        int "Camera D2 (Y4) pin (custom)"
+        default 8
+    config DROWSY_CAM_PIN_Y3
+        int "Camera D1 (Y3) pin (custom)"
+        default 9
+    config DROWSY_CAM_PIN_Y2
+        int "Camera D0 (Y2) pin (custom)"
+        default 11
+    config DROWSY_CAM_PIN_VSYNC
+        int "Camera VSYNC pin (custom)"
+        default 6
+    config DROWSY_CAM_PIN_HREF
+        int "Camera HREF pin (custom)"
+        default 7
+    config DROWSY_CAM_PIN_PCLK
+        int "Camera PCLK pin (custom)"
+        default 13
+
+    # ----------------------------------------------------------
+    # Camera resolution
+    # ----------------------------------------------------------
+    choice DROWSY_FRAME_SIZE
+        prompt "Camera frame size"
+        default DROWSY_FRAME_SIZE_240X240
+        help
+            Resolution camera.
+            - 240x240: MẶC ĐỊNH - cấu hình ĐÃ CHẠY ỔN ĐỊNH 9.9 FPS trên board
+              OV5640 (bản đầu tiên hoạt động tốt). Mặt cũng to hơn -> detect tốt hơn.
+            - QVGA 320x240: thử khi cần góc rộng (nhưng FPS ~4 và nguy cơ
+              heap corrupt khi kết hợp DMA/XCLK cao).
+
+    config DROWSY_FRAME_SIZE_240X240
+        bool "240x240 (khuyên dùng - ổn định)"
+    config DROWSY_FRAME_SIZE_QVGA
+        bool "QVGA 320x240"
+    endchoice
+
+    config DROWSY_CAM_RGB565_BE
+        bool "RGB565 big-endian (thử khi face=0, màu da bị xanh/tím)"
+        default n
+        help
+            Mặc định LE (little-endian - đúng esp32-camera). Nếu stream hiện màu
+            SAI (da người thành xanh/tím) nghĩa là byte order ngược -> bật option
+            này để AI nhận đúng màu (face detection mới hoạt động).
+
+    # ----------------------------------------------------------
+    # GPIO cảnh báo
+    # LƯU Ý N16R8/S3-EYE: camera chiếm GPIO 4,5,6,7,8,9,10,11,12,13,15,16,17,18
+    # -> Buzzer/LED mặc định dùng 14/21 (trống). Đổi board thì đổi ở đây.
+    # ----------------------------------------------------------
+    config DROWSY_BUZZER_GPIO
+        int "Buzzer GPIO"
+        default 14
+        help
+            Chân cắm buzzer (PWM 2kHz qua LEDC).
+
+    config DROWSY_LED_GPIO
+        int "Warning LED GPIO"
+        default 21
+        help
+            Chân cắm LED cảnh báo (GPIO output).
+
+    # ----------------------------------------------------------
+    # PFLD model - số điểm landmark + preprocessing
+    # ----------------------------------------------------------
+    choice DROWSY_PFLD_MODEL
+        prompt "PFLD landmark model (số điểm)"
+        default DROWSY_PFLD_68PT
+        help
+            Chọn model landmark nhúng trong firmware. Mapping landmark khác nhau:
+            - 68 điểm (torchlm/wgs, iBUG/300-W): mũi 27-35, mắt 36-41/42-47, miệng 48-67
+            - 98 điểm (polarisZhao/pytorch-pfld, WFLW): mũi 51-59, mắt 60-67/68-75, miệng 76-97
+            PHẢI khớp với file .espdl được nhúng trong CMakeLists.txt.
+
+        config DROWSY_PFLD_68PT
+            bool "68 điểm (torchlm/wgs) - model/pfld68.espdl"
+
+        config DROWSY_PFLD_98PT
+            bool "98 điểm (polarisZhao/pytorch-pfld) - model/pfld_landmarks_98.espdl"
+    endchoice
+
+    config DROWSY_PFLD_NUM_POINTS
+        int
+        default 68 if DROWSY_PFLD_68PT
+        default 98 if DROWSY_PFLD_98PT
+
+    config DROWSY_PFLD_MODEL_FILE
+        string
+        default "pfld68.espdl" if DROWSY_PFLD_68PT
+        default "pfld_landmarks_98.espdl" if DROWSY_PFLD_98PT
+
+    config DROWSY_PFLD_MEAN
+        int "PFLD input mean (0-255)"
+        default 0
+        help
+            Preprocessing model PFLD: chỉ chia 255 -> input [0,1] => mean=0, std=255.
+            Công thức esp-dl: (pixel-mean)/std.
+            Nếu model của bạn dùng (x/255-0.5)/0.5 thì đổi mean=128, std=128.
+
+    config DROWSY_PFLD_STD
+        int "PFLD input std (0-255)"
+        default 255
+        help
+            Giá trị std khi normalize input PFLD. Model mặc định train với
+            ToTensor thuần -> std=255.
+
+    config DROWSY_PFLD_RGB_SWAP
+        bool "PFLD model expects BGR (rgb_swap)"
+        default n
+        help
+            Bật nếu model landmark của bạn được train với ảnh BGR
+            (giống MTMN face detect). Mặc định TẮT = model nhận RGB.
+
+    # ----------------------------------------------------------
+    # Ngưỡng phát hiện buồn ngủ (EAR/MAR/PERCLOS)
+    # Có thể chỉnh runtime: drowsy set <tên> <giá trị>
+    # ----------------------------------------------------------
+    # LƯU Ý: Kconfig KHÔNG có kiểu float -> dùng int đơn vị MILLI (x1000).
+    # VD: 200 = 0.200. Code sẽ chia /1000 khi đọc.
+    config DROWSY_EAR_BLINK_TH
+        int "EAR blink threshold (x1000)"
+        default 200
+        help
+            EAR < ngưỡng này = mắt nhắm (blink). EAR mở mắt thường ~0.28-0.35,
+            nhắm mắt ~0.10-0.15 (PFLD 98 điểm). Đơn vị: 1000 = 1.0.
+
+    config DROWSY_EAR_DROWSY_TH
+        int "EAR drowsy threshold (x1000)"
+        default 160
+        help
+            EAR < ngưỡng này và kéo dài = mắt nhắm lâu (microsleep/drowsy).
+
+    config DROWSY_MAR_TH
+        int "MAR yawn threshold (x1000)"
+        default 500
+        help
+            MAR (độ mở miệng chuẩn hoá) vượt ngưỡng + kéo dài >= 1s = 1 lần ngáp.
+
+    config DROWSY_MICROSLEEP_MS
+        int "Microsleep time (ms)"
+        default 1200
+        help
+            Mắt nhắm liên tục >= ngưỡng này (ms) = MICROSLEEP (cảnh báo khẩn).
+
+    config DROWSY_PERCLOS_TH
+        int "PERCLOS threshold (x1000, 400 = 40%)"
+        default 400
+        help
+            % khung hình mắt nhắm (EAR < DROWSY_TH) trong cửa sổ trượt
+            >= ngưỡng này = DROWSY. PERCLOS là metric chuẩn quốc tế
+            (PERcentage of eye CLOSure). Đơn vị: 1000 = 100%.
+
+    config DROWSY_WINDOW_MS
+        int "PERCLOS window (ms)"
+        default 60000
+        help
+            Cửa sổ trượt tính PERCLOS (mặc định 60 giây).
+
+    config DROWSY_BLINK_RATE_HIGH
+        int "High blink rate (blinks/min)"
+        default 20
+        help
+            Blink rate >= ngưỡng này góp điểm mệt mỏi (blink nhanh bất thường).
+
+    config DROWSY_PITCH_DEV_TH
+        int "Head pitch deviation threshold (x1000)"
+        default 120
+        help
+            Độ lệch pitch so với baseline (người tỉnh táo) >= ngưỡng này
+            góp điểm mệt mỏi (cúi gật đầu). Đơn vị: 1000 = 1.0.
+
+    config DROWSY_FPS_LOG_INTERVAL_S
+        int "FPS log interval (s)"
+        default 5
+        help
+            Chu kỳ in FPS + metrics ra log (giây).
+
+    # ----------------------------------------------------------
+    # Console debug
+    # ----------------------------------------------------------
+    config DROWSY_CONSOLE_ENABLE
+        bool "Enable runtime console (drowsy get/set/stats/reset)"
+        default y
+        help
+            Bật esp_console qua USB-Serial/JTAG. Tắt để tiết kiệm RAM ~5KB.
+
+    # ----------------------------------------------------------
+    # Web monitor (giống human_face_detection/web của esp-who)
+    # ----------------------------------------------------------
+    config DROWSY_WEB_ENABLE
+        bool "Enable web monitor (WiFi + MJPEG stream + /status)"
+        default y
+        help
+            Bật web UI: mở trình duyệt http://<IP> để xem stream + số liệu.
+
+    choice DROWSY_WIFI_MODE
+        prompt "WiFi mode"
+        default DROWSY_WIFI_MODE_AP
+        depends on DROWSY_WEB_ENABLE
+        help
+            - AP: thiết bị TỰ phát WiFi (demo - không cần router).
+              Điện thoại vào WiFi <DROWSY_AP_SSID> rồi mở http://192.168.4.1
+            - STA: nối vào router có sẵn (SSID/PASS bên dưới).
+            - OFF: tắt WiFi hoàn toàn (tiết kiệm điện).
+
+    config DROWSY_WIFI_MODE_AP
+        bool "AP mode (thiết bị tự phát WiFi - demo)"
+    config DROWSY_WIFI_MODE_STA
+        bool "STA mode (nối router)"
+    config DROWSY_WIFI_MODE_OFF
+        bool "Tắt WiFi"
+    endchoice
+
+    config DROWSY_AP_SSID
+        string "AP SSID"
+        default "Drowsy_AP"
+        depends on DROWSY_WIFI_MODE_AP
+
+    config DROWSY_AP_PASS
+        string "AP password"
+        default "12345678"
+        depends on DROWSY_WIFI_MODE_AP
+        help
+            Để trống = mạng mở (WIFI_AUTH_OPEN).
+
+    config DROWSY_WIFI_SSID
+        string "WiFi SSID (STA mode)"
+        default "ESP32"
+        depends on DROWSY_WIFI_MODE_STA
+
+    config DROWSY_WIFI_PASS
+        string "WiFi password (STA mode)"
+        default ""
+        depends on DROWSY_WIFI_MODE_STA
+
+    config DROWSY_ADMIN_PASS
+        string "Admin panel password"
+        default "admin"
+        depends on DROWSY_WEB_ENABLE
+        help
+            Mật khẩu cho trang /admin (quản lý cấu hình thiết bị).
+
+    config DROWSY_WEB_HTTP_PORT
+        int "HTTP port (trang + status + capture)"
+        default 80
+        depends on DROWSY_WEB_ENABLE
+
+    config DROWSY_WEB_STREAM_PORT
+        int "Stream port (MJPEG)"
+        default 81
+        depends on DROWSY_WEB_ENABLE
+
+    config DROWSY_WEB_JPEG_QUALITY
+        int "Stream JPEG quality (0-100)"
+        default 45
+        range 20 90
+        depends on DROWSY_WEB_ENABLE
+        help
+            Chất lượng JPEG cho MJPEG stream. Cao -> nét hơn nhưng file lớn hơn,
+            encode chậm hơn (lag stream). Mặc định 45: cân bằng tốc độ/nét.
+            Muốn rõ hơn: 55-60. Muốn mượt hơn: 30-40.
+
+    config DROWSY_WEB_STREAM_SKIP
+        int "Stream frame skip (gửi 1/N frame)"
+        default 3
+        range 1 10
+        depends on DROWSY_WEB_ENABLE
+        help
+            Gửi 1/N số frame qua stream để giảm tải encode JPEG + bandwidth.
+            Mặc định 3: gửi 1/3 frame (AI FPS ~3.8 -> stream ~1.3 FPS đủ xem).
+            Giảm xuống 2 nếu muốn stream mượt hơn, tăng lên 4-5 nếu vẫn lag.
+
+    # ----------------------------------------------------------
+    # NGUỒN STATE CHÍNH (loại 2 luồng trạng thái song song)
+    # ----------------------------------------------------------
+    # Sau phương án AI offload, APP (điện thoại) là nguồn tính state mặc định.
+    # Khi bật DROWSY_AI_ON_DEVICE=n (mặc định): ESP32 KHÔNG build/chạy ai_task
+    # -> không có state edge -> log serial sạch, buzzer/LED chỉ do app gửi
+    # POST /api/alarm. Bật =y chỉ khi cần edge tự nhận diện (fallback khi không app).
+    config DROWSY_AI_ON_DEVICE
+        bool "ESP32 tự nhận diện state (edge) — fallback khi không có app"
+        default n
+        help
+            n (mặc định): APP là nguồn state. ESP32 chỉ stream + nhận POST /api/alarm
+            -> bật buzzer/LED. Không chạy face detect/PFLD -> tiết kiệm CPU/RAM.
+            y: ESP32 tự chạy AI pipeline + state machine (như bản trước offload),
+            dùng khi không có điện thoại. App chỉ hiển thị (không gửi alarm).
+
+    # ----------------------------------------------------------
+    # Báo trạng thái lên Admin Server (đa thiết bị)
+    # ----------------------------------------------------------
+    config DROWSY_REPORT_ENABLE
+        bool "Enable report to Admin Server (multi-device)"
+        default y
+        depends on DROWSY_WEB_ENABLE && DROWSY_WIFI_MODE_STA
+        help
+            Thiết bị POST JSON trạng thái mỗi 5s lên server quản lý đa thiết bị
+            (server/drowsy_admin - Flask). Chỉ hoạt động ở STA mode.
+
+    config DROWSY_REPORT_URL
+        string "Admin Server URL"
+        default "http://192.168.1.100:5000/api/report"
+        depends on DROWSY_REPORT_ENABLE
+        help
+            Ví dụ: http://<IP-máy-chạy-server>:5000/api/report
+
+    config DROWSY_DEVICE_ID
+        string "Device ID (rỗng = tự sinh từ MAC)"
+        default ""
+        depends on DROWSY_REPORT_ENABLE
+
+    config DROWSY_DRIVER_NAME
+        string "Tài xế (driver name)"
+        default ""
+        depends on DROWSY_REPORT_ENABLE
+        help
+            Tên tài xế hiển thị trên dashboard quản lý.
+
+    config DROWSY_LOCATION
+        string "Địa chỉ xe (location)"
+        default ""
+        depends on DROWSY_REPORT_ENABLE
+        help
+            Địa chỉ/vị trí xe (vd: Bến xe Mỹ Đình). Chưa có GPS -> chuỗi cấu hình.
+
+endmenu

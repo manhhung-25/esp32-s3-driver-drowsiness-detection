@@ -1,0 +1,6 @@
+# ============================================================================
+# LƯU Ý: File này KHÔNG được IDF 5.3 nạp (Kconfig.projbuild chỉ được nạp khi
+# nằm TRONG thư mục component). Nội dung thật đã chuyển sang:
+#   main/Kconfig.projbuild
+# Vui lòng sửa file ở main/ nếu cần đổi cấu hình.
+# ============================================================================

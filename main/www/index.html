@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Driver Drowsiness Monitor</title>
+<style>
+  body { background:#111; color:#ddd; font-family: monospace; margin:16px; }
+  h2 { color:#4fc3f7; }
+  .row { display:flex; flex-wrap:wrap; gap:16px; }
+  img { width:480px; max-width:100%; border:2px solid #333; border-radius:6px; background:#000; }
+  table { border-collapse:collapse; min-width:300px; }
+  td,th { padding:4px 10px; text-align:left; border-bottom:1px solid #333; }
+  .ok { color:#4caf50; } .warn { color:#ffc107; } .danger { color:#f44336; }
+  button { background:#1565c0; color:#fff; border:0; padding:8px 16px; border-radius:4px; cursor:pointer; }
+</style>
+</head>
+<body>
+<h2>&#128663; Driver Drowsiness Monitor</h2>
+<div class="row">
+  <div>
+    <img id="stream" src="/stream" alt="stream">
+    <p><button onclick="capture()">&#128247; Chụp ảnh</button></p>
+  </div>
+  <div>
+    <table id="status"><tr><td colspan="2">Đang tải...</td></tr></table>
+  </div>
+</div>
+<script>
+async function refresh() {
+  try {
+    const r = await fetch('/status');
+    const j = await r.json();
+    const cls = j.state_id >= 3 ? 'danger' : (j.state_id >= 2 ? 'warn' : (j.state_id >= 1 ? 'warn' : 'ok'));
+    document.getElementById('status').innerHTML =
+      '<tr><th colspan="2" class="' + cls + '">TRẠNG THÁI: ' + j.state + '</th></tr>' +
+      '<tr><td>EAR (độ mở mắt)</td><td>' + j.ear.toFixed(3) + '</td></tr>' +
+      '<tr><td>MAR (độ mở miệng)</td><td>' + j.mar.toFixed(3) + '</td></tr>' +
+      '<tr><td>Pitch dev</td><td>' + j.pitch_dev.toFixed(3) + '</td></tr>' +
+      '<tr><td>PERCLOS</td><td>' + j.perclos.toFixed(0) + '%</td></tr>' +
+      '<tr><td>Blink/phút</td><td>' + j.blink_min.toFixed(1) + '</td></tr>' +
+      '<tr><td>Ngáp/phút</td><td>' + j.yawn_min.toFixed(1) + '</td></tr>' +
+      '<tr><td>Fatigue</td><td>' + j.fatigue.toFixed(2) + '</td></tr>' +
+      '<tr><td>FPS</td><td>' + j.fps.toFixed(1) + '</td></tr>' +
+      '<tr><td>Khuôn mặt</td><td>' + (j.face ? 'Có' : 'Không') + '</td></tr>' +
+      '<tr><td>Landmark OK</td><td>' + (j.metrics_ok ? 'Có' : 'Không') + '</td></tr>';
+  } catch (e) {
+    document.getElementById('status').innerHTML = '<tr><td>Lỗi kết nối...</td></tr>';
+  }
+}
+function capture() {
+  const a = document.createElement('a');
+  a.href = '/capture';
+  a.download = 'capture.jpg';
+  a.click();
+}
+setInterval(refresh, 1000);
+refresh();
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+## IDF Component Manager Manifest
+## esp-dl v3.x: runtime dl::module + .espdl (yêu cầu IDF >= 5.3)
+## esp32-camera: driver camera (cùng component esp-who sử dụng)
+## espressif/mdns: IDF 5.3 KHÔNG còn bundled components/mdns -> lấy từ registry
+dependencies:
+  espressif/esp-dl:
+    version: "^3.3.0"
+  espressif/esp32-camera:
+    version: "^2"
+  espressif/mdns:
+    version: "^1"

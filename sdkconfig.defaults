@@ -1,0 +1,35 @@
+# ===== Driver Drowsiness Detection - cấu hình chung =====
+
+# ---- Flash: N16 = 16MB, QIO 80MHz ----
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+
+# ---- Partition table tuỳ chỉnh (models nằm trong app RODATA) ----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- Console qua USB-Serial/JTAG (monitor trực tiếp cổng USB) ----
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ---- Bỏ stub để flash nhanh & ổn định với camera ----
+CONFIG_ESPTOOLPY_NO_STUB=y
+
+# ---- Cấu hình CAMERA ỔN ĐỊNH (bản đầu tiên chạy 9.9 FPS):
+# 240x240 + KHÔNG DMA (DMA làm heap corrupt -> reboot) ----
+CONFIG_DROWSY_FRAME_SIZE_240X240=y
+
+# ---- QUAN TRỌNG: camera OV5640 xuất RGB565 BIG-ENDIAN - esp-dl PHẢI đọc BE
+# (bật option này msr mới >0, face detection mới hoạt động!) ----
+CONFIG_DROWSY_CAM_RGB565_BE=y
+
+# ---- Model nhúng RODATA -> PSRAM: tăng tốc inference (PFLD 519ms quá chậm
+# do đọc model từ flash qua cache). Nếu gây lỗi, bỏ dòng này. ----
+CONFIG_SPIRAM_RODATA=y
+
+# ---- Web monitor (mặc định BẬT; SSID/PASS đặt trong menuconfig) ----
+CONFIG_DROWSY_WEB_ENABLE=y
+CONFIG_DROWSY_WEB_HTTP_PORT=80
+CONFIG_DROWSY_WEB_STREAM_PORT=81
+# WiFi mode mặc định: AP (demo - thiết bị tự phát WiFi Drowsy_AP)
+CONFIG_DROWSY_WIFI_MODE_AP=y
