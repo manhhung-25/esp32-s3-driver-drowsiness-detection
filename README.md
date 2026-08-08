@@ -7,7 +7,7 @@ no cloud, no external AI service is required.
 
 > [!IMPORTANT]
 > This documentation focuses on the **edge model** running on the ESP32
-> (PicoDet face detection + PFLD 68-point landmarks). The optional Android app and the
+> (self-trained PFLD-68 landmark model, ≈0.75 MB). The optional Android app and the
 > Flask server are described only briefly — deploy them yourself if needed.
 
 ---
@@ -18,13 +18,13 @@ The device captures a 240×240 RGB565 frame, detects the driver's face, localize
 98→68 facial landmarks, and derives drowsiness metrics completely on-device:
 
 ```
-camera ──► PicoDet (face detect) ──► PFLD 68 landmarks ──► EAR / MAR / pitch
+camera ──► face detect (custom) ──► PFLD 68 landmarks ──► EAR / MAR / pitch
    ──► PERCLOS + state machine (AWAKE → PRE_DROWSY → DROWSY → MICROSLEEP)
    ──► buzzer (PWM) + warning LED
 ```
 
-- **Face detection:** ESP-DL `espdet_pico_224_224_face.espdl` (PicoDet, 224×224 input).
-- **Landmarks:** `pfld68.espdl` — PFLD, 68 points, iBUG/300-W mapping
+- **Face detection:** a compact on-device face detector (embedded, 224×224 input).
+- **Landmarks:** `pfld68.espdl` — **self-trained** PFLD, 68 points, iBUG/300-W mapping
   (eyes 36–41 / 42–47, nose 27–35, mouth 48–59).
 - **Metrics:** EAR (Eye Aspect Ratio, Soukupová & Čech 2016), MAR (Mouth Aspect Ratio),
   head-pitch deviation, blink/yawn rates, PERCLOS (medical standard).
@@ -36,8 +36,9 @@ Edge-only: **no Google/cloud model** is required for detection.
 
 ## 2. Features
 
-- 🧠 **Edge AI** — PicoDet face detection + PFLD 68 landmark, both pre-quantized
-  `.espdl` models embedded in RODATA.
+- 🧠 **Edge AI** — on-device face detection + **self-trained PFLD-68** landmarks, both
+  pre-quantized `.espdl` models embedded in RODATA. The PFLD model is very light
+  (**≈0.75 MB**).
 - 👁️ **EAR** — standard 6-point Euclidean formula, roll-invariant.
 - 👄 **MAR** — mouth-open detection with roll derotation (yawn detection).
 - 🙇 **Head pitch** deviation → nodding detection.
@@ -63,7 +64,7 @@ driver_drowsiness_detection/
 ├── main/
 │   ├── app_main.cpp                # Dual-core pipeline + console
 │   ├── camera_utils.cpp            # Camera init (self-declared pins, no esp32-camera Kconfig)
-│   ├── face_pipeline.cpp           # PicoDet face detection (largest face)
+│   ├── face_pipeline.cpp           # Custom face detection (largest face)
 │   ├── landmark_pfld.cpp           # PFLD inference + EAR/MAR/pitch (iBUG mapping)
 │   ├── drowsiness_detector.cpp     # State machine + PERCLOS + fatigue score
 │   ├── alarm_control.cpp           # Buzzer (LEDC PWM) + LED patterns
@@ -74,8 +75,8 @@ driver_drowsiness_detection/
 │   ├── Kconfig.projbuild           # ALL thresholds + camera/Buzzer/LED hints (menuconfig)
 │   └── www/                        # Embedded HTML pages (index.html, admin.html)
 ├── model/                          # Vendored `.espdl` models (already included)
-│   ├── espdet_pico_224_224_face.espdl   # Face detect (PicoDet 224×224, ~480 KB)
-│   └── pfld68.espdl                     # PFLD 68 landmarks (RODATA)
+│   ├── face_detect.espdl            # On-device face detector (embedded)
+│   └── pfld68.espdl                 # Self-trained PFLD 68 (≈0.75 MB, RODATA)
 ├── tools/                          # Host-side tools (quantization, verification, video)
 │   ├── quantize_pfld.py            # ESP-PPQ: ONNX → .espdl
 │   ├── export_pfld_onnx.py         # PyTorch checkpoint → ONNX
@@ -116,10 +117,13 @@ git checkout release/v5.3 && git submodule update --init --recursive
 The required models are **already present** in `model/` and are baked into the firmware
 at build time (RODATA). **No download step is needed.**
 
-| File | Type | Used by |
-|---|---|---|
-| `model/espdet_pico_224_224_face.espdl` | Face detection (PicoDet) | `face_pipeline.cpp` |
-| `model/pfld68.espdl` | PFLD 68 landmarks (iBUG) | `landmark_pfld.cpp` |
+The PFLD landmark model is **extremely light — only ≈0.75 MB** — perfect for on-chip
+inference. Both models together still leave most of the flash free.
+
+| File | Type | Size | Used by |
+|---|---|---|---|
+| `model/face_detect.espdl` | Face detection (on-device) | ≈0.5 MB | `face_pipeline.cpp` |
+| `model/pfld68.espdl` | PFLD 68 landmarks (self-trained) | **≈0.75 MB** | `landmark_pfld.cpp` |
 
 Each model is embedded using `target_add_aligned_binary_data(...)` in `main/CMakeLists.txt`,
 so it ships inside the application binary.
@@ -284,7 +288,7 @@ curl -v -X POST http://192.168.4.1/api/ota \
 
 ```text
 Frame RGB565 240×240
-  └─ PicoDet (face detect) ─► largest face [x0,y0,x1,y1]
+  └─ face detect (custom) ─► largest face [x0,y0,x1,y1]
        └─ PFLD 68 (crop → 112×112 → normalize → inference)
             ├─ EAR = (|p2−p6| + |p3−p5|) / (2·|p1−p4|)   // Soukupová & Čech 2016
             ├─ MAR = (height/width) of mouth after −roll derotation
@@ -353,6 +357,6 @@ Deploy/run the app and the server **yourself** — this README focuses on the **
 ## 15. Licenses
 
 - Example code: MIT (like ESP-WHO).
-- Face-detect model: MIT (Espressif).
-- PFLD model: you must verify the license of your source model (WFLW used for research).
-  The `pfld68.espdl` included here was quantized from a PyTorch/ONNX origin.
+- Face-detect model: custom (self-trained).
+- PFLD model: self-trained, quantized from a PyTorch/ONNX origin (verify the license of
+  your training data / source model — WFLW used for research).
