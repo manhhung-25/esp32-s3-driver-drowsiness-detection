@@ -17,7 +17,8 @@ Video cho thấy dashboard thời gian thực tại `192.168.4.1`, khung khuôn 
 
 ## Bài toán và giá trị sản phẩm
 
-Các giải pháp drowsiness detection dùng Raspberry Pi 5 có dư hiệu năng cho bài toán chỉ cần một camera và một người lái, nhưng kéo theo Linux, thẻ nhớ, nguồn công suất lớn hơn và giải pháp tản nhiệt. Dự án này đưa toàn bộ pipeline thị giác xuống một vi điều khiển:
+Các giải pháp drowsiness detection dùng Raspberry Pi 5 có dư hiệu năng cho bài toán chỉ cần một camera và một người lái, nhưng kéo theo Linux, thẻ nhớ, nguồn công suất lớn hơn, giải pháp tản nhiệt và điều to lớn nhất là chi phí triển khai rất lớn (trên 3.300.000 cho 1 sản phẩm). 
+Dự án này sẽ đưa toàn bộ pipeline thị giác xuống một vi điều khiển:
 
 - xử lý tại thiết bị, không gửi hình ảnh khuôn mặt lên cloud;
 - hoạt động độc lập, không phụ thuộc Internet hoặc điện thoại;
