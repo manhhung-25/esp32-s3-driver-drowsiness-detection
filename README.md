@@ -11,6 +11,10 @@
 
 [![Nhấn để xem video thử nghiệm ESP32-S3](docs/demo/demo-preview.png)](docs/demo/esp32_laixeantoan.mp4)
 
+<video src="https://github.com/manhhung-25/esp32-s3-driver-drowsiness-detection/raw/refs/heads/main/docs/demo/esp32_laixeantoan.mp4" controls width="100%">
+  Trình duyệt không hỗ trợ phát video nhúng. Hãy dùng liên kết xem/tải bên dưới.
+</video>
+
 **[▶ Xem/tải video thử nghiệm gốc (53,3 giây, 1080×634, H.264)](docs/demo/esp32_laixeantoan.mp4)**
 
 Video cho thấy dashboard thời gian thực tại `192.168.4.1`, khung khuôn mặt, 68 landmarks, EAR, MAR, PERCLOS, trạng thái mắt/ngáp, CAM FPS và AI FPS. File được giữ nguyên để người xem có thể kiểm chứng; SHA-256: `0FD7CBF3D524BF15B2650107BE75E9BB775A2D8CADD7094F09C0DC193E0F7D77`.
