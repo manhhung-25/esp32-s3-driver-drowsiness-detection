@@ -11,9 +11,7 @@
 
 [![Nhấn để xem video thử nghiệm ESP32-S3](docs/demo/demo-preview.png)](docs/demo/esp32_laixeantoan.mp4)
 
-<video src="https://github.com/manhhung-25/esp32-s3-driver-drowsiness-detection/raw/refs/heads/main/docs/demo/esp32_laixeantoan.mp4" controls width="100%">
-  Trình duyệt không hỗ trợ phát video nhúng. Hãy dùng liên kết xem/tải bên dưới.
-</video>
+https://github.com/user-attachments/assets/b3aa748c-6d28-4aa0-8814-622d4ee694fd
 
 **[▶ Xem/tải video thử nghiệm gốc (53,3 giây, 1080×634, H.264)](docs/demo/esp32_laixeantoan.mp4)**
 
