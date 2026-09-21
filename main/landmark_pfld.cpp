@@ -45,8 +45,41 @@ bool LandmarkPFLD::init()
 
 bool LandmarkPFLD::run(const dl::image::img_t &frame, const std::vector<int> &face_box, float *landmarks)
 {
-    if (face_box.size() < 4) return false;
-    m_pre->preprocess(frame, face_box);
+    if (face_box.size() < 4 || landmarks == nullptr) return false;
+
+    // ---- Chuyển face_box (chữ nhật PicoDet) thành SQUARE BOX (vuông + margin 1.15x) ----
+    // PFLD model được train trên crop vuông -> nếu crop chữ nhật bị co giãn làm sai lệch landmark.
+    float x1 = (float)face_box[0];
+    float y1 = (float)face_box[1];
+    float x2 = (float)face_box[2];
+    float y2 = (float)face_box[3];
+
+    float w = x2 - x1;
+    float h = y2 - y1;
+    if (w <= 0.0f || h <= 0.0f) return false;
+
+    float cx = (x1 + x2) * 0.5f;
+    float cy = (y1 + y2) * 0.5f;
+
+    // Tỉ lệ mở rộng nhẹ (1.15x) để trùm hết cằm/trán/mắt
+    float max_dim = (w > h ? w : h) * 1.15f;
+    const float max_allowed = frame.width < frame.height ? (float)frame.width : (float)frame.height;
+    if (max_dim > max_allowed) max_dim = max_allowed;
+
+    float sq_x1 = cx - max_dim * 0.5f;
+    float sq_y1 = cy - max_dim * 0.5f;
+    float sq_x2 = cx + max_dim * 0.5f;
+    float sq_y2 = cy + max_dim * 0.5f;
+
+    // Clamp vào biên ảnh
+    if (sq_x1 < 0.0f) { sq_x2 -= sq_x1; sq_x1 = 0.0f; }
+    if (sq_y1 < 0.0f) { sq_y2 -= sq_y1; sq_y1 = 0.0f; }
+    if (sq_x2 > (float)frame.width) { sq_x1 -= sq_x2 - (float)frame.width; sq_x2 = (float)frame.width; }
+    if (sq_y2 > (float)frame.height) { sq_y1 -= sq_y2 - (float)frame.height; sq_y2 = (float)frame.height; }
+
+    std::vector<int> sq_box = {(int)sq_x1, (int)sq_y1, (int)sq_x2, (int)sq_y2};
+
+    m_pre->preprocess(frame, sq_box);
     m_model->run();
 
     dl::TensorBase *out = m_model->get_output();
@@ -61,14 +94,44 @@ bool LandmarkPFLD::run(const dl::image::img_t &frame, const std::vector<int> &fa
         return false;
     }
 
-    const float scale = powf(2.0f, (float)out->get_exponent());
-    const int8_t *data = out->get_element_ptr<int8_t>();
-    const float box_w = (float)(face_box[2] - face_box[0]);
-    const float box_h = (float)(face_box[3] - face_box[1]);
+    const dl::dtype_t dtype = out->get_dtype();
+    const float scale = dtype == dl::DATA_TYPE_FLOAT ? 1.0f : powf(2.0f, (float)out->get_exponent());
+    const float box_w = (float)(sq_box[2] - sq_box[0]);
+    const float box_h = (float)(sq_box[3] - sq_box[1]);
 
     for (int i = 0; i < PFLD_NUM_POINTS; ++i) {
-        landmarks[i * 2] = face_box[0] + (float)data[i * 2] * scale * box_w;
-        landmarks[i * 2 + 1] = face_box[1] + (float)data[i * 2 + 1] * scale * box_h;
+        float nx = 0.0f;
+        float ny = 0.0f;
+        switch (dtype) {
+        case dl::DATA_TYPE_INT8: {
+            const int8_t *data = out->get_element_ptr<int8_t>();
+            nx = (float)data[i * 2] * scale;
+            ny = (float)data[i * 2 + 1] * scale;
+            break;
+        }
+        case dl::DATA_TYPE_INT16: {
+            const int16_t *data = out->get_element_ptr<int16_t>();
+            nx = (float)data[i * 2] * scale;
+            ny = (float)data[i * 2 + 1] * scale;
+            break;
+        }
+        case dl::DATA_TYPE_FLOAT: {
+            const float *data = out->get_element_ptr<float>();
+            nx = data[i * 2];
+            ny = data[i * 2 + 1];
+            break;
+        }
+        default:
+            ESP_LOGE(TAG, "Unsupported PFLD output dtype: %d", (int)dtype);
+            return false;
+        }
+
+        if (!isfinite(nx) || !isfinite(ny) || nx < -0.15f || nx > 1.15f || ny < -0.15f || ny > 1.15f) {
+            ESP_LOGW(TAG, "PFLD point %d outside normalized crop: %.3f, %.3f", i, nx, ny);
+            return false;
+        }
+        landmarks[i * 2] = (float)sq_box[0] + nx * box_w;
+        landmarks[i * 2 + 1] = (float)sq_box[1] + ny * box_h;
     }
     return true;
 }

@@ -1,4 +1,4 @@
-#pragma once
+    #pragma once
 
 // ============================================================================
 // config_store.hpp - Lưu cấu hình thiết bị vào NVS (sống qua reboot)

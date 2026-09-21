@@ -18,6 +18,7 @@
 
 // ---- Các trạng thái (đồng bộ với alarm_control) ----
 enum class DrowsyState : int {
+    DISTRACTED = 4,
     AWAKE = 0,
     PRE_DROWSY = 1, // cảnh báo nhẹ: LED nhấp 1Hz
     DROWSY = 2,     // cảnh báo: LED 2Hz + còi beep định kỳ
@@ -26,6 +27,9 @@ enum class DrowsyState : int {
 
 // ---- Tham số có thể chỉnh runtime ----
 struct DrowsyParams {
+    float distract_yaw_th;
+    uint32_t distract_ms;
+    uint32_t face_lost_ms;
     float ear_blink_th;      // EAR < ngưỡng này = mắt nhắm (blink)
     float ear_drowsy_th;     // EAR < ngưỡng này = mắt nhắm sâu (drowsy evidence)
     float mar_th;            // MAR > ngưỡng này = miệng mở (ngáp)
@@ -56,7 +60,7 @@ public:
      * @param pitch         Tỷ lệ pitch hình học (frontal ~0.33-0.45)
      * @param now_ms        Thời gian hiện tại (esp_timer_get_time()/1000)
      */
-    DrowsyState update(bool face_detected, float ear, float mar, float pitch, uint64_t now_ms);
+    DrowsyState update(bool face_detected, float ear, float mar, float pitch, float yaw, uint64_t now_ms);
 
     // ---- Truy vấn số liệu (cho log + console) ----
     DrowsyState state() const { return m_state; }
@@ -69,6 +73,12 @@ public:
     float pitch_dev() const { return m_pitch_dev; }
     float ear() const { return m_last_ear; }
     float mar() const { return m_last_mar; }
+    bool eyes_closed() const { return m_eye_closed; }
+    bool yawning() const { return m_yawn_armed; }
+    bool attention_off() const { return m_attention_off; }
+    uint32_t attention_off_ms() const;
+    float yaw_dev() const { return m_yaw_dev; }
+    float yaw_baseline() const { return m_yaw_baseline; }
 
     DrowsyParams &params() { return m_params; }
 
@@ -80,6 +90,7 @@ private:
     // ---- theo dõi mắt ----
     bool m_eye_closed = false;      // EAR < ear_blink_th
     bool m_eye_deep_closed = false; // EAR < ear_drowsy_th
+    bool m_eye_seen = false;        // đã có mẫu mắt hợp lệ đầu tiên
     uint64_t m_closed_since = 0;    // thời điểm bắt đầu nhắm mắt
     uint64_t m_deep_closed_since = 0;
     uint64_t m_open_since = 0;      // thời điểm mắt mở lại (chống rung state)
@@ -101,6 +112,17 @@ private:
     int m_yawn_hist_n = 0;
 
     // ---- PERCLOS ring buffer (1 mẫu/frame) ----
+    bool m_attention_off = false;
+    uint64_t m_attention_off_since = 0;
+    uint64_t m_face_missing_since = 0;
+    float m_yaw_baseline = 0;
+    float m_yaw_acc = 0;
+    float m_yaw_filtered = 0;
+    float m_yaw_dev = 0;
+    int m_yaw_n = 0;
+    bool m_yaw_ready = false;
+    bool m_yaw_filter_valid = false;
+
     static const int PERCLOS_SAMPLES = 1024;
     bool m_closed_samples[PERCLOS_SAMPLES];
     uint64_t m_closed_times[PERCLOS_SAMPLES]; // ms
@@ -109,6 +131,7 @@ private:
 
     // ---- pitch baseline (học khi AWAKE) ----
     float m_pitch_baseline = 0.35f;
+    bool m_pitch_ready = false;
     float m_pitch_acc = 0;
     int m_pitch_n = 0;
     float m_pitch_dev = 0;

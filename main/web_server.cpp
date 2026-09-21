@@ -37,6 +37,7 @@
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/task.h"
 #include "img_converters.h"
@@ -55,6 +56,16 @@ static volatile bool s_stream_active = false;
 // fix M2: spinlock bảo vệ struct web_metrics_t (AI task Core 1 ghi,
 // httpd handler + report_client Core 0 đọc) chống torn read.
 static portMUX_TYPE s_metrics_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_overlay_mux = portMUX_INITIALIZER_UNLOCKED;
+
+#define WEB_OVERLAY_MAX_POINTS 98
+typedef struct {
+    int face_box[4];
+    float landmarks[WEB_OVERLAY_MAX_POINTS * 2];
+    int landmark_count;
+    bool valid;
+} overlay_cache_t;
+static overlay_cache_t s_overlay_cache = {};
 
 void web_metrics_lock(void)
 {
@@ -64,6 +75,38 @@ void web_metrics_lock(void)
 void web_metrics_unlock(void)
 {
     portEXIT_CRITICAL(&s_metrics_mux);
+}
+
+void web_note_camera_frame(void)
+{
+    static uint32_t frames = 0;
+    static int64_t window_start_us = 0;
+    const int64_t now_us = esp_timer_get_time();
+    if (window_start_us == 0) window_start_us = now_us;
+    ++frames;
+    const int64_t elapsed_us = now_us - window_start_us;
+    if (elapsed_us < 1000000) return;
+
+    web_metrics_lock();
+    if (s_metrics != NULL) {
+        s_metrics->fps = frames * 1000000.0f / (float)elapsed_us;
+    }
+    web_metrics_unlock();
+    frames = 0;
+    window_start_us = now_us;
+}
+
+void web_cache_overlay(const int *face_box, const float *landmarks, int landmark_count, bool face_ok)
+{
+    portENTER_CRITICAL(&s_overlay_mux);
+    s_overlay_cache.valid = face_ok && face_box != NULL && landmarks != NULL &&
+                            landmark_count > 0 && landmark_count <= WEB_OVERLAY_MAX_POINTS;
+    if (s_overlay_cache.valid) {
+        memcpy(s_overlay_cache.face_box, face_box, sizeof(s_overlay_cache.face_box));
+        memcpy(s_overlay_cache.landmarks, landmarks, landmark_count * 2 * sizeof(float));
+        s_overlay_cache.landmark_count = landmark_count;
+    }
+    portEXIT_CRITICAL(&s_overlay_mux);
 }
 
 // fix offload: app đăng ký queue alarm (từ AlarmControl::init) để POST /api/alarm
@@ -257,15 +300,30 @@ void web_draw_overlay(camera_fb_t *fb,
     if (metrics != NULL) {
         char line1[40], line2[40], line3[40];
         snprintf(line1, sizeof(line1), "EAR %.2f MAR %.2f", metrics->ear, metrics->mar);
-        snprintf(line2, sizeof(line2), "ST %d FPS %.1f PER %d%%", metrics->state,
-                 metrics->fps, (int)(metrics->perclos * 100.0f));
-        snprintf(line3, sizeof(line3), "FAC %d BL %.0f YW %.0f", metrics->face,
-                 metrics->blink_rate, metrics->yawn_rate);
+        snprintf(line2, sizeof(line2), "ST %d CAM %.1f AI %.1f", metrics->state,
+                 metrics->fps, metrics->ai_fps);
+        snprintf(line3, sizeof(line3), "EYE %s YAWN %d ATT %d", metrics->eyes_closed ? "CLOSE" : "OPEN",
+                 metrics->yawn_active, metrics->attention_off);
         uint16_t c1 = (metrics->state >= 2) ? RGB565_RED : RGB565_WHITE;
         draw_text(buf, w, h, 2, 2, line1, c1);
         draw_text(buf, w, h, 2, 10, line2, c1);
         draw_text(buf, w, h, 2, 18, line3, RGB565_WHITE);
     }
+}
+
+void web_draw_cached_overlay(camera_fb_t *fb)
+{
+    overlay_cache_t overlay = {};
+    web_metrics_t metrics = {};
+    portENTER_CRITICAL(&s_overlay_mux);
+    overlay = s_overlay_cache;
+    portEXIT_CRITICAL(&s_overlay_mux);
+    web_metrics_lock();
+    if (s_metrics != NULL) metrics = *s_metrics;
+    web_metrics_unlock();
+    web_draw_overlay(fb, overlay.valid ? overlay.face_box : nullptr,
+                     overlay.valid ? overlay.landmarks : nullptr,
+                     overlay.valid, &metrics);
 }
 
 // ============================================================================
@@ -284,25 +342,27 @@ static esp_err_t index_handler(httpd_req_t *req)
 
 static esp_err_t status_handler(httpd_req_t *req)
 {
-    char buf[320];
-    const char *st[] = {"AWAKE", "PRE_DROWSY", "DROWSY", "MICROSLEEP"};
+    char buf[512];
+    const char *st[] = {"AWAKE", "PRE_DROWSY", "DROWSY", "MICROSLEEP", "DISTRACTED"};
     // fix M2: copy metrics dưới spinlock (AI task Core 1 ghi) tránh torn read
     web_metrics_t m = {};
     web_metrics_lock();
     if (s_metrics) m = *s_metrics;
     web_metrics_unlock();
     int st_idx = m.state;
-    if (st_idx < 0 || st_idx > 3) st_idx = 0;
+    if (st_idx < 0 || st_idx > 4) st_idx = 0;
     snprintf(buf, sizeof(buf),
              "{\"state\":\"%s\",\"state_id\":%d,\"ear\":%.3f,\"mar\":%.3f,"
-             "\"pitch\":%.3f,\"pitch_dev\":%.3f,\"perclos\":%.1f,\"blink_min\":%.1f,"
-             "\"yawn_min\":%.1f,\"fatigue\":%.2f,\"fps\":%.1f,\"face\":%d,\"metrics_ok\":%d}",
+             "\"pitch\":%.3f,\"pitch_dev\":%.3f,\"yaw_dev\":%.3f,\"yaw_baseline\":%.3f,\"perclos\":%.1f,\"blink_min\":%.1f,"
+             "\"yawn_min\":%.1f,\"fatigue\":%.2f,\"fps\":%.1f,\"ai_fps\":%.1f,\"face\":%d,\"metrics_ok\":%d,"
+             "\"eyes_closed\":%d,\"yawn_active\":%d,\"attention_off\":%d,\"attention_off_ms\":%u}",
              st[st_idx], st_idx,
              m.ear, m.mar,
-             m.pitch, m.pitch_dev,
+             m.pitch, m.pitch_dev, m.yaw_dev, m.yaw_baseline,
              m.perclos * 100.0f,
              m.blink_rate, m.yawn_rate,
-             m.fatigue, m.fps, m.face, m.metrics_ok);
+             m.fatigue, m.fps, m.ai_fps, m.face, m.metrics_ok,
+             m.eyes_closed, m.yawn_active, m.attention_off, (unsigned)m.attention_off_ms);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, buf, strlen(buf));
@@ -519,6 +579,9 @@ static esp_err_t stream_handler(httpd_req_t *req)
         }
         if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)jpg, jpg_len);
         free(jpg);
+        // JPEG conversion runs in the HTTP task on CPU0. Yield so IDLE0 can
+        // service the task watchdog during a long-lived MJPEG connection.
+        vTaskDelay(1);
     }
     httpd_resp_send_chunk(req, NULL, 0); // kết thúc multipart
     s_stream_active = false;
@@ -929,6 +992,13 @@ void web_server_init(QueueHandle_t frame_i,
                      DrowsinessDetector *detector,
                      device_config_t *config)
 {
+    // Keep the MJPEG encoder in the same RGB565 byte order as ESP-DL.
+#if CONFIG_DROWSY_CAM_RGB565_BE
+    jpgSetRgb565BE(true);
+#else
+    jpgSetRgb565BE(false);
+#endif
+
     s_frame_queue = frame_i;
     s_metrics = metrics;
     s_detector = detector;
@@ -939,23 +1009,22 @@ void web_server_init(QueueHandle_t frame_i,
 
     wifi_mode_init();
 
-    // ---- HTTP server (port 80): TẤT CẢ endpoint, kể cả /stream ----
-    // LƯU Ý (fix camera không stream): trang web dùng <img src="/stream"> (URL
-    // tương đối -> port 80), app Android cũng gọi http://<ip>/stream (port 80).
-    // Trước đây /stream nằm ở server port 81 riêng -> 404 -> không hiện ảnh!
-    // -> gộp /stream vào server port 80. esp_http_server chạy đa luồng
-    // (max_open_sockets mặc định 7) nên stream dài không chặn /status /admin.
+    // Keep status/admin and the long-lived MJPEG connection on separate HTTP
+    // servers. The small limits prevent browser reconnects from exhausting
+    // the global lwIP socket table.
     httpd_config_t httpd_conf = HTTPD_DEFAULT_CONFIG();
-    httpd_conf.max_uri_handlers = 11; // 8 echo + /api/alarm + /api/ota mới
+    httpd_conf.max_uri_handlers = 10;
+    httpd_conf.max_open_sockets = 3;
     httpd_conf.server_port = CONFIG_DROWSY_WEB_HTTP_PORT;
     // Pin httpd sang CORE 0: JPEG encode + send stream rất tốn CPU, nếu chạy
     // chung Core 1 với AI pipeline sẽ kéo FPS xuống (9.9 -> 2.5 như đã thấy).
     httpd_conf.core_id = 0;
     // QUAN TRỌNG (fix reboot khi mở stream): stack mặc định 4096 quá nhỏ cho
     // stream_handler + frame2jpg (encode JPEG tốn stack) -> tràn stack -> crash
-    // -> esp_restart. Nâng lên 8KB. Ưu tiên thấp (prio 2) để không cướp AI/camera.
+    // -> esp_restart. Nâng lên 8KB. Ưu tiên cao hơn camera để HTTP vẫn phản hồi
+    // khi AI on-device đang chạy nặng.
     httpd_conf.stack_size = 8192;
-    httpd_conf.task_priority = 2; // IDF 5.3: tên trường là task_priority
+    httpd_conf.task_priority = 6; // camera_task priority 5
     // fix lag: client chậm (mạng AP kém) không được block handler lâu -> nếu
     // send/recv treo quá 3s thì httpd coi như lỗi, thoát handler, giải phóng
     // Core 0 (trước đây timeout mặc định rất dài -> handler nghẽn -> app
@@ -970,7 +1039,6 @@ void web_server_init(QueueHandle_t frame_i,
     httpd_uri_t acf = {.uri = "/admin/api/config", .method = HTTP_GET, .handler = admin_config_handler, .user_ctx = NULL};
     httpd_uri_t arb = {.uri = "/admin/api/reboot", .method = HTTP_GET, .handler = admin_reboot_handler, .user_ctx = NULL};
     httpd_uri_t alg = {.uri = "/admin/api/log", .method = HTTP_GET, .handler = admin_log_handler, .user_ctx = NULL};
-    httpd_uri_t str = {.uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL};
     httpd_uri_t arm = {.uri = "/api/alarm", .method = HTTP_POST, .handler = alarm_handler, .user_ctx = NULL};
     httpd_uri_t ota = {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_handler, .user_ctx = NULL};
 
@@ -983,10 +1051,28 @@ void web_server_init(QueueHandle_t frame_i,
         httpd_register_uri_handler(httpd, &acf);
         httpd_register_uri_handler(httpd, &arb);
         httpd_register_uri_handler(httpd, &alg);
-        httpd_register_uri_handler(httpd, &str);
         httpd_register_uri_handler(httpd, &arm);
         httpd_register_uri_handler(httpd, &ota);
-        ESP_LOGI(TAG, "HTTP server on port %d (stream + admin cùng port)", httpd_conf.server_port);
+        ESP_LOGI(TAG, "HTTP status server on port %d", httpd_conf.server_port);
+    }
+
+    // A stream handler is intentionally long-lived. Running it on its own HTTP
+    // server keeps /status and the admin API responsive while MJPEG is open.
+    httpd_config_t stream_conf = HTTPD_DEFAULT_CONFIG();
+    stream_conf.server_port = CONFIG_DROWSY_WEB_STREAM_PORT;
+    stream_conf.ctrl_port = httpd_conf.ctrl_port + 1;
+    stream_conf.max_uri_handlers = 1;
+    stream_conf.max_open_sockets = 1;
+    stream_conf.core_id = 0;
+    stream_conf.stack_size = 8192;
+    stream_conf.task_priority = 6;
+    stream_conf.send_wait_timeout = 3;
+    stream_conf.recv_wait_timeout = 3;
+    httpd_handle_t stream_httpd = NULL;
+    httpd_uri_t str = {.uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL};
+    if (httpd_start(&stream_httpd, &stream_conf) == ESP_OK) {
+        httpd_register_uri_handler(stream_httpd, &str);
+        ESP_LOGI(TAG, "MJPEG stream server on port %d", stream_conf.server_port);
     }
 
     xTaskCreatePinnedToCore(web_drain_task, "web_drain", 3 * 1024, NULL, 4, NULL, 1);
@@ -1008,6 +1094,12 @@ void web_server_init(QueueHandle_t frame_i,
 void web_log_line(const char *fmt, ...) { (void)fmt; }
 void web_metrics_lock(void) {}
 void web_metrics_unlock(void) {}
+void web_note_camera_frame(void) {}
+void web_cache_overlay(const int *face_box, const float *landmarks, int landmark_count, bool face_ok)
+{
+    (void)face_box; (void)landmarks; (void)landmark_count; (void)face_ok;
+}
+void web_draw_cached_overlay(camera_fb_t *fb) { (void)fb; }
 // fix offload: stub cho trường hợp tắt WEB (không lỗi link)
 void web_server_set_alarm_queue(QueueHandle_t q) { (void)q; }
 void web_draw_overlay(camera_fb_t *fb, const int *face_box, const float *landmarks,

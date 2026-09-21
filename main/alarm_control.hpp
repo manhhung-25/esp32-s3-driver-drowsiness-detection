@@ -28,6 +28,9 @@ public:
      */
     QueueHandle_t init();
 
+    void set_test_state(DrowsyState state);
+    void clear_test_state();
+
 private:
     static void alarm_task(void *arg);
 };

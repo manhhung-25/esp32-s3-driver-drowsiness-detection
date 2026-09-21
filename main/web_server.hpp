@@ -33,13 +33,20 @@ typedef struct {
     float mar;
     float pitch;
     float pitch_dev;
+    float yaw_dev;
+    float yaw_baseline;
     float perclos;      // 0..1
     float blink_rate;   // nhịp/phút
     float yawn_rate;    // lần/phút
     float fatigue;      // 0..1
-    float fps;
+    float fps;          // camera frames delivered to the web pipeline
+    float ai_fps;       // face/landmark pipeline throughput
     int face;           // 1 = có khuôn mặt
     int metrics_ok;     // 1 = landmark hợp lệ
+    int eyes_closed;
+    int yawn_active;
+    int attention_off;
+    uint32_t attention_off_ms;
 } web_metrics_t;
 
 /**
@@ -73,6 +80,10 @@ void web_log_line(const char *fmt, ...);
  */
 void web_metrics_lock(void);
 void web_metrics_unlock(void);
+
+void web_note_camera_frame(void);
+void web_cache_overlay(const int *face_box, const float *landmarks, int landmark_count, bool face_ok);
+void web_draw_cached_overlay(camera_fb_t *fb);
 
 /**
  * @brief Vẽ overlay lên frame RGB565: khung mặt + 98 landmark + text metrics.

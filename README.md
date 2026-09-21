@@ -1,362 +1,269 @@
-# Driver Drowsiness Detection — ESP32-S3-N16R8 (ESP-WHO + ESP-DL v3 + PFLD)
+# Hệ thống giám sát buồn ngủ và mất tập trung trên ESP32-S3
 
-A fully **on-device (edge AI)** driver-drowsiness monitoring system built for the
-**ESP32-S3-N16R8** (16 MB flash + 8 MB octal PSRAM), using **ESP-WHO** as a base and
-**ESP-DL v3** for inference. Face landmark analysis (PFLD 68 points) runs **on the chip** —
-no cloud, no external AI service is required.
+> Edge AI chạy trực tiếp trên ESP32-S3-N16R8: nhận diện khuôn mặt, 68 facial landmarks, EAR/MAR/PERCLOS, hướng đầu và cảnh báo buzzer/LED — không cần Raspberry Pi, PC hay cloud để ra quyết định.
+
+[![ESP32-S3](https://img.shields.io/badge/MCU-ESP32--S3-red)](https://www.espressif.com/en/products/socs/esp32-s3)
+[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-5.3.5-blue)](https://github.com/espressif/esp-idf)
+[![ESP-DL](https://img.shields.io/badge/ESP--DL-v3.3-green)](https://github.com/espressif/esp-dl)
+[![Edge AI](https://img.shields.io/badge/AI-100%25_on--device-purple)](#kiến-trúc-hệ-thống)
+
+## Video thử nghiệm thực tế
+
+[![Nhấn để xem video thử nghiệm ESP32-S3](docs/demo/demo-preview.png)](docs/demo/esp32_laixeantoan.mp4)
+
+**[▶ Xem/tải video thử nghiệm gốc (53,3 giây, 1080×634, H.264)](docs/demo/esp32_laixeantoan.mp4)**
+
+Video cho thấy dashboard thời gian thực tại `192.168.4.1`, khung khuôn mặt, 68 landmarks, EAR, MAR, PERCLOS, trạng thái mắt/ngáp, CAM FPS và AI FPS. File được giữ nguyên để người xem có thể kiểm chứng; SHA-256: `0FD7CBF3D524BF15B2650107BE75E9BB775A2D8CADD7094F09C0DC193E0F7D77`.
+
+## Bài toán và giá trị sản phẩm
+
+Các giải pháp drowsiness detection dùng Raspberry Pi 5 có dư hiệu năng cho bài toán chỉ cần một camera và một người lái, nhưng kéo theo Linux, thẻ nhớ, nguồn công suất lớn hơn và giải pháp tản nhiệt. Dự án này đưa toàn bộ pipeline thị giác xuống một vi điều khiển:
+
+- xử lý tại thiết bị, không gửi hình ảnh khuôn mặt lên cloud;
+- hoạt động độc lập, không phụ thuộc Internet hoặc điện thoại;
+- khởi động firmware trực tiếp, ít thành phần hơn để triển khai trên xe;
+- dùng Wi-Fi tích hợp để xem dashboard, cấu hình và OTA khi cần;
+- giảm chi phí phần cứng so với một hệ Raspberry Pi 5 hoàn chỉnh.
+
+Thiết bị theo dõi đồng thời bốn nhóm tín hiệu: mắt nhắm, ngáp, cúi/gật đầu và quay đầu/mất khuôn mặt. Cảnh báo được đưa ra bằng buzzer và LED theo mức độ `AWAKE → PRE_DROWSY → DROWSY → MICROSLEEP`, kèm trạng thái `DISTRACTED` cho mất tập trung.
 
 > [!IMPORTANT]
-> This documentation focuses on the **edge model** running on the ESP32
-> (self-trained PFLD-68 landmark model, ≈0.75 MB). The optional Android app and the
-> Flask server are described only briefly — deploy them yourself if needed.
+> Đây là prototype hỗ trợ cảnh báo, chưa phải thiết bị an toàn chức năng hoặc thiết bị y tế. Benchmark hiện tại là thử nghiệm kỹ thuật quy mô nhỏ; không dùng các số liệu dưới đây như chứng nhận an toàn giao thông.
 
----
+## Kiến trúc hệ thống
 
-## 1. Overview
-
-The device captures a 240×240 RGB565 frame, detects the driver's face, localizes
-98→68 facial landmarks, and derives drowsiness metrics completely on-device:
-
-```
-camera ──► face detect (custom) ──► PFLD 68 landmarks ──► EAR / MAR / pitch
-   ──► PERCLOS + state machine (AWAKE → PRE_DROWSY → DROWSY → MICROSLEEP)
-   ──► buzzer (PWM) + warning LED
-```
-
-- **Face detection:** a compact on-device face detector (embedded, 224×224 input).
-- **Landmarks:** `pfld68.espdl` — **self-trained** PFLD, 68 points, iBUG/300-W mapping
-  (eyes 36–41 / 42–47, nose 27–35, mouth 48–59).
-- **Metrics:** EAR (Eye Aspect Ratio, Soukupová & Čech 2016), MAR (Mouth Aspect Ratio),
-  head-pitch deviation, blink/yawn rates, PERCLOS (medical standard).
-- **State machine:** with hysteresis, triggers buzzer/LED.
-
-Edge-only: **no Google/cloud model** is required for detection.
-
----
-
-## 2. Features
-
-- 🧠 **Edge AI** — on-device face detection + **self-trained PFLD-68** landmarks, both
-  pre-quantized `.espdl` models embedded in RODATA. The PFLD model is very light
-  (**≈0.75 MB**).
-- 👁️ **EAR** — standard 6-point Euclidean formula, roll-invariant.
-- 👄 **MAR** — mouth-open detection with roll derotation (yawn detection).
-- 🙇 **Head pitch** deviation → nodding detection.
-- ⏱️ **PERCLOS** (medical standard) + fatigue score + state machine
-  `AWAKE → PRE_DROWSY → DROWSY → MICROSLEEP`.
-- 🚨 **GPIO alarms** — buzzer (PWM via LEDC) + LED patterns per state.
-- ⚡ **Dual-core** — camera on Core 0, AI + alarm on Core 1.
-- 🛠️ **Runtime console** — `drowsy get/set/stats/reset` (no rebuild to tune thresholds).
-- 🌐 **Web interface** — MJPEG stream, `/status`, live overlay, admin config.
-- 📶 **WiFi modes** — AP (default), STA (router/Internet), OFF.
-- 📦 **OTA firmware update** — flash new firmware over the air from the app / curl.
-
----
-
-## 3. Repository layout
-
-```text
-driver_drowsiness_detection/
-├── CMakeLists.txt                  # Standalone project (Component Registry deps)
-├── partitions.csv                  # OTA layout: otadata + ota_0 + ota_1
-├── sdkconfig.defaults(.esp32s3)    # 16 MB flash, Octal PSRAM 80 MHz, CPU 240 MHz
-├── sdkconfig                        # Current build config (.esp32s3 target)
-├── main/
-│   ├── app_main.cpp                # Dual-core pipeline + console
-│   ├── camera_utils.cpp            # Camera init (self-declared pins, no esp32-camera Kconfig)
-│   ├── face_pipeline.cpp           # Custom face detection (largest face)
-│   ├── landmark_pfld.cpp           # PFLD inference + EAR/MAR/pitch (iBUG mapping)
-│   ├── drowsiness_detector.cpp     # State machine + PERCLOS + fatigue score
-│   ├── alarm_control.cpp           # Buzzer (LEDC PWM) + LED patterns
-│   ├── console_cmds.cpp            # `drowsy` command (get/set/stats/reset)
-│   ├── web_server.cpp              # HTTP: /, /stream, /status, /admin, /api/alarm, /api/ota
-│   ├── config_store.cpp            # NVS device config (thresholds, WiFi)
-│   ├── report_client.cpp           # Periodic JSON report to Flask server (STA only)
-│   ├── Kconfig.projbuild           # ALL thresholds + camera/Buzzer/LED hints (menuconfig)
-│   └── www/                        # Embedded HTML pages (index.html, admin.html)
-├── model/                          # Vendored `.espdl` models (already included)
-│   ├── face_detect.espdl            # On-device face detector (embedded)
-│   └── pfld68.espdl                 # Self-trained PFLD 68 (≈0.75 MB, RODATA)
-├── tools/                          # Host-side tools (quantization, verification, video)
-│   ├── quantize_pfld.py            # ESP-PPQ: ONNX → .espdl
-│   ├── export_pfld_onnx.py         # PyTorch checkpoint → ONNX
-│   ├── export_pyfeat_pfld68.py     # py-feat/68 export
-│   ├── verify_pfld_mapping.py      # verify landmark mapping on host
-│   ├── annotate_landmark_video.py  # annotate landmarks on a video (host)
-│   ├── check_calib.py, setup_quant_env.sh, quantize_pfld_espdl.md
-└── partitions.csv                  # OTA partition table (16 MB)
+```mermaid
+flowchart LR
+    CAM[OV2640<br/>RGB565 240×240] --> FD[ESPDet-Pico<br/>face detection]
+    FD --> PFLD[PFLD-68 INT8<br/>112×112 landmarks]
+    PFLD --> METRIC[EAR · MAR<br/>pitch · yaw]
+    METRIC --> FUSION[PERCLOS + rates<br/>hysteresis + timers]
+    FUSION --> STATE[AWAKE · PRE_DROWSY<br/>DROWSY · MICROSLEEP<br/>DISTRACTED]
+    STATE --> ALARM[Buzzer PWM + LED]
+    CAM --> WEB[MJPEG dashboard]
+    METRIC --> WEB
+    STATE --> WEB
 ```
 
----
+Luồng xử lý được chia theo FreeRTOS:
 
-## 4. Requirements
+- Core 0 lấy ảnh camera và luôn ưu tiên frame mới nhất.
+- Core 1 chạy face detection/PFLD và state machine.
+- Alarm chạy non-blocking; web stream có queue riêng nên không giữ lại frame AI cũ.
 
-| Component   | Version      | Notes                                             |
-|-------------|--------------|---------------------------------------------------|
-| ESP-IDF     | **≥ 5.3**    | esp-dl v3.3 requires IDF ≥ 5.3                    |
-| Python      | 3.8 – 3.12   | only for host tools (quantization, video annotation) |
-| esp-dl      | ^3.3.0       | via `main/idf_component.yml` (registry, auto-fetch) |
-| esp32-camera| ^2           | via registry                                       |
-| espressif/mdns | ^1        | via registry                                       |
+## Những cải tiến so với giải pháp ban đầu
 
-```bash
-cd ~/esp/esp-idf
-git checkout release/v5.3 && git submodule update --init --recursive
-./install.sh esp32s3 && . ./export.sh
-```
+Dự án kế thừa giải pháp gốc tại [`phuongproduc/Driver-Drowsiness-Detection-ESP32-S3-N16R8-ESP-WHO-ESP-DL-v3-PFLD-`](https://github.com/phuongproduc/Driver-Drowsiness-Detection-ESP32-S3-N16R8-ESP-WHO-ESP-DL-v3-PFLD-) (mốc đối chiếu `9125dfe`, ngày 08/08/2026). Bản gốc đã đặt nền móng cho face detection + PFLD + EAR/MAR/PERCLOS, cảnh báo GPIO, web dashboard và OTA. Phiên bản này bổ sung/điều chỉnh:
 
-> [!WARNING]
-> This example uses **esp-dl v3 from the IDF Component Registry**, not the esp-who
-> submodule esp-dl v2 — so it does **not** interfere with the other esp-who examples.
-> To return to an older IDF: `git checkout release/v5.0 && . ./export.sh` (not recommended).
-
----
-
-## 5. Models — already vendored
-
-The required models are **already present** in `model/` and are baked into the firmware
-at build time (RODATA). **No download step is needed.**
-
-The PFLD landmark model is **extremely light — only ≈0.75 MB** — perfect for on-chip
-inference. Both models together still leave most of the flash free.
-
-| File | Type | Size | Used by |
+| Hạng mục | Giải pháp ban đầu | Cải tiến trong phiên bản này | Lợi ích |
 |---|---|---|---|
-| `model/face_detect.espdl` | Face detection (on-device) | ≈0.5 MB | `face_pipeline.cpp` |
-| `model/pfld68.espdl` | PFLD 68 landmarks (self-trained) | **≈0.75 MB** | `landmark_pfld.cpp` |
+| Nguồn quyết định | Mặc định offload trạng thái sang điện thoại | `DROWSY_AI_ON_DEVICE=y`; toàn bộ AI chạy trên ESP32-S3 | Độc lập điện thoại/cloud |
+| Mất tập trung | Chưa có trạng thái riêng | `DISTRACTED`, yaw lệch so với baseline, face-lost grace và timer | Phân biệt quay đầu với buồn ngủ |
+| Bám khuôn mặt | Chạy detector/PFLD theo chu kỳ cố định | Cache face box/landmarks, kiểm tra IoU; detector mỗi 4 frame khi đã khóa mặt | Giảm tải nhưng không dùng nhầm landmark của mặt mới |
+| Lịch AI | Queue có thể tích frame cũ | Queue AI 1 phần tử, lấy frame mới nhất; camera và web có nhịp riêng | Giảm độ trễ tích lũy |
+| PFLD | Crop theo face box | Crop vuông mở rộng 1,15×, clamp biên, kiểm tra dtype/range | Landmark ổn định hơn khi box không vuông |
+| Head pose | Pitch tĩnh | Baseline pitch/yaw tự học và cập nhật chậm khi tài xế tỉnh | Bù vị trí camera và tư thế người dùng |
+| Cảnh báo | Phụ thuộc state dài hạn | Tín hiệu mắt/ngáp/mất tập trung có đường cảnh báo tức thời; microsleep tăng dần cường độ | Phản hồi sớm và dễ nhận biết |
+| Alarm task | Ghi GPIO ở mọi tick | Chỉ ghi khi output đổi, `xTaskDelayUntil`, kiểm tra lỗi driver, có lệnh test | Ổn định timing và dễ kiểm thử phần cứng |
+| Web | FPS/overlay gắn với nhịp AI | Cache overlay có khóa, tách CAM FPS/AI FPS, thêm cờ eye/yawn/attention | Dashboard phản ánh đúng pipeline |
+| Hiệu năng S3 | Cấu hình an toàn chung | Octal PSRAM 80 MHz, PSRAM DMA, cache 64 KB, instruction/RODATA ở PSRAM, CPU 240 MHz | Tận dụng đúng N16R8 |
+| OTA | Slot khoảng 3,75 MiB | Hai slot 4,5 MiB | Đủ chỗ cho firmware + 2 model nhúng |
+| Đo kiểm | Log vận hành thông thường | `BENCH,SAMPLE`, marker console, CSV ground truth, script precision/recall/F1/latency | Benchmark có thể lặp lại |
 
-Each model is embedded using `target_add_aligned_binary_data(...)` in `main/CMakeLists.txt`,
-so it ships inside the application binary.
+Các thay đổi chính nằm trong `main/app_main.cpp`, `main/drowsiness_detector.cpp`, `main/landmark_pfld.cpp`, `main/alarm_control.cpp`, `main/web_server.cpp` và `main/benchmark.cpp`.
 
-> [!NOTE]
-> If you want to use the **98-point PFLD** instead, select it in menuconfig
-> (`DROWSY_PFLD_98PT`) and put the quantized model at
-> `model/pfld_landmarks_98.espdl`. The 68-point mapping is the default.
+## Benchmark
 
----
+### 1. Demo sản phẩm 53,3 giây
 
-## 6. Build / Flash / Monitor
+Thông số được đọc từ file video gốc và sáu mốc hiển thị tại 0/5/15/30/40/50 giây:
+
+| Chỉ số | Kết quả quan sát |
+|---|---:|
+| Video | 53,33 s · H.264 · 1080×634 · 30 FPS |
+| CAM FPS trên dashboard | 9,7–10,8 FPS |
+| AI FPS trên dashboard | 2,9–4,0 FPS |
+| Face + landmark | Hiển thị trực tiếp trên dashboard |
+| Tín hiệu minh họa | Mắt mở/nhắm, ngáp, EAR, MAR, PERCLOS, pitch/yaw |
+
+Khoảng FPS trên chỉ là các giá trị ở những mốc lấy mẫu của video, không phải trung bình toàn phiên.
+
+### 2. Benchmark gán nhãn thủ công 91,7 giây
+
+Phiên ngày 09/09/2026 gồm 335 mẫu AI, face + landmark hợp lệ ở 99,4% mẫu. Ground truth gồm 2 đoạn mắt nhắm, 5 lần ngáp và 2 đoạn mất tập trung.
+
+| Hành vi | Precision | Recall | F1 | Event recall | Độ trễ p50 / p95 |
+|---|---:|---:|---:|---:|---:|
+| Mắt nhắm (raw signal) | 68,3% | 63,1% | 65,6% | 2/2 | 627 / 762 ms |
+| Ngáp | 100,0% | 72,8% | 84,3% | 5/5 | 649 / 1.012 ms |
+| Mất tập trung | 97,4% | 90,5% | 93,8% | 2/2 | 642 / 1.062 ms |
+
+Đây là benchmark trước các bản sửa alarm/false-alert/FPS ngày 12/09/2026. Vì vậy bảng được giữ như baseline trung thực, không dùng để tuyên bố các bản sửa sau đã tăng accuracy nếu chưa chạy lại cùng kịch bản. Xem [báo cáo PDF](benchmark_results/bao_cao_danh_gia_he_thong_buong_ngu.pdf), [ground truth CSV](benchmark_results/2026-09-09_phone_ground_truth.csv) và [cách tái lập](benchmark_results/README.md).
+
+### 3. Footprint firmware/model
+
+| Thành phần | Kích thước đo được |
+|---|---:|
+| `pfld68.espdl` | 831.808 byte (0,793 MiB) |
+| `espdet_pico_224_224_face.espdl` | 495.840 byte (0,473 MiB) |
+| Firmware `.bin` | 4.134.080 byte (3,943 MiB) |
+| Mỗi OTA slot | 4.718.592 byte (4,5 MiB) |
+| Mức sử dụng OTA slot | 87,6% — còn 584.512 byte |
+
+## ESP32-S3 so với Raspberry Pi 5
+
+| Tiêu chí | ESP32-S3-N16R8 của dự án | Raspberry Pi 5 |
+|---|---|---|
+| Mục tiêu thiết kế | Vi điều khiển edge AI chuyên một tác vụ | Máy tính Linux đa dụng |
+| CPU/RAM | 2× Xtensa LX7 240 MHz, 8 MB PSRAM | 4× Cortex-A76 2,4 GHz, RAM từ 1 GB |
+| Hệ điều hành | Firmware/FreeRTOS, không cần Linux | Raspberry Pi OS/Linux |
+| AI của dự án | ESP-DL + model INT8 nhúng flash | Có thể chạy model lớn hơn, framework Linux |
+| Camera/kết nối | DVP camera, Wi-Fi/BLE tích hợp | MIPI camera, Wi-Fi/BLE; cần storage và phụ kiện triển khai |
+| Nguồn/tản nhiệt | Phù hợp thiết bị nhúng nhỏ gọn | Nhà sản xuất khuyến nghị nguồn 5 V–5 A và active cooling để đạt hiệu năng tốt |
+| Chi phí hệ thống | MCU + camera + buzzer/LED, BOM thấp | Board hiện được Raspberry Pi niêm yết từ 45 USD, chưa gồm camera/storage/nguồn/tản nhiệt |
+| Quyền riêng tư | Ảnh được xử lý tại thiết bị | Có thể xử lý local nhưng hệ thống phức tạp hơn |
+
+### Về tuyên bố “độ chính xác như Raspberry Pi 5”
+
+Độ chính xác nhận diện do **model, dữ liệu, preprocessing, lượng tử hóa và threshold**, không do tên board tự quyết định. Khi hai nền tảng chạy cùng model và cùng logic, việc chuyển sang ESP32-S3 chủ yếu đánh đổi throughput/độ trễ; INT8 có thể giữ chất lượng gần mô hình gốc nếu hiệu chuẩn tốt. Trong dự án này, PFLD/metric/state machine được giữ trên thiết bị và benchmark cho thấy ngáp/mất tập trung đạt F1 lần lượt 84,3%/93,8% ở phiên thử ngắn.
+
+Vì chưa có benchmark A/B cùng video trên Raspberry Pi 5, cách diễn đạt kiểm chứng được là:
+
+> **ESP32-S3 duy trì cùng mục tiêu và logic nhận diện của giải pháp Raspberry Pi-class cho bài toán một tài xế, với chi phí và độ phức tạp phần cứng thấp hơn; cần benchmark A/B trên cùng tập dữ liệu trước khi tuyên bố độ chính xác thống kê tương đương.**
+
+Điểm lợi của ESP32-S3 không phải “mạnh hơn Pi 5”, mà là **đủ dùng, rẻ hơn và gọn hơn cho đúng tác vụ**.
+
+## Phần cứng và phần mềm
+
+| Thành phần | Cấu hình |
+|---|---|
+| MCU | ESP32-S3-N16R8 — 16 MB flash, 8 MB Octal PSRAM |
+| Camera | OV2640, RGB565, 240×240 |
+| Cảnh báo | Buzzer PWM (mặc định GPIO 14), LED (mặc định GPIO 21) |
+| SDK | ESP-IDF 5.3.5 hoặc nhánh 5.3+ |
+| AI runtime | `espressif/esp-dl ^3.3.0` |
+| Camera driver | `espressif/esp32-camera ^2` |
+| Mạng | SoftAP mặc định; STA/OFF tùy chọn |
+
+## Build, flash và chạy
+
+### Cách nhanh nhất trên Windows: một lệnh
+
+Máy chỉ cần có **Git** và **PowerShell**. Script dưới đây tự tải đúng ESP-IDF `v5.3.5`, cài toolchain ESP32-S3, phục hồi các component đúng phiên bản từ `dependencies.lock`, rồi build firmware:
+
+```powershell
+git clone https://github.com/manhhung-25/esp32-s3-driver-drowsiness-detection.git
+cd esp32-s3-driver-drowsiness-detection
+.\scripts\bootstrap.ps1
+```
+
+Muốn build, nạp board và mở monitor trong cùng một lệnh (thay `COM7` bằng cổng thực tế):
+
+```powershell
+.\scripts\bootstrap.ps1 -Port COM7
+```
+
+Lần chạy đầu cần Internet và có thể mất vài phút vì ESP-IDF/toolchain được cài vào `%LOCALAPPDATA%\Espressif`. Các lần sau script tái sử dụng môi trường đã cài. Chỉ muốn build lại nhanh dùng `.\scripts\build.ps1`; muốn flash dùng `.\scripts\flash_monitor.ps1 -Port COM7`.
+
+### Linux/macOS hoặc môi trường đã có ESP-IDF
 
 ```bash
-. ~/esp/esp-idf/export.sh
-idf.py set-target esp32s3                    # once
-idf.py menuconfig                            # optional: tune pins/thresholds
+git clone https://github.com/manhhung-25/esp32-s3-driver-drowsiness-detection.git
+cd esp32-s3-driver-drowsiness-detection
+
+# Nạp môi trường ESP-IDF 5.3+
+. $IDF_PATH/export.sh
+
+idf.py set-target esp32s3
 idf.py build
-idf.py -p /dev/ttyACM0 flash                 # full flash (see OTA note below)
-idf.py -p /dev/ttyACM0 monitor               # serial console (USB-Serial/JTAG)
+idf.py -p /dev/ttyACM0 flash monitor
 ```
 
-> [!IMPORTANT]
-> The partition table is **OTA layout** (`ota_0`/`ota_1` + `otadata`). The **first** flash
-> must be a **full flash** (`flash`, not `app-flash`) so the bootloader + otadata + slot are
-> written correctly. After that, subsequent updates can go through OTA.
+### Dependency và khả năng tái lập
 
----
+- Firmware C/C++: `main/idf_component.yml` khai báo dependency; `dependencies.lock` khóa đúng phiên bản ESP-DL, camera, JPEG và mDNS. ESP-IDF Component Manager tự tải chúng ở lần build đầu; không cần commit thư mục sinh tự động `managed_components/`.
+- Model chạy thật đã nằm sẵn trong `model/`: `espdet_pico_224_224_face.espdl` và `pfld68.espdl`; người clone không cần quantize lại.
+- Công cụ Python tùy chọn (kiểm tra ONNX, video, export/quantize model): cài bằng `python -m pip install -r requirements.txt`, hoặc chạy bootstrap với `-WithPythonTools`.
+- GitHub Actions trong `.github/workflows/build.yml` tự build lại firmware bằng ESP-IDF `v5.3.5` sau mỗi lần push/PR để phát hiện sớm repo thiếu file hoặc dependency.
 
-## 7. Menuconfig reference (`Drowsiness Detection Configuration`)
+Lần nạp đầu phải dùng `flash`, không dùng riêng `app-flash`, vì dự án dùng `otadata` và hai OTA slot.
 
-All parameters are available in `idf.py menuconfig` → **Drowsiness Detection
-Configuration** (from `main/Kconfig.projbuild`).
+### Sử dụng nhanh
 
-| Option | Default | Meaning |
+1. Cấp nguồn cho board và camera.
+2. Kết nối Wi-Fi `Drowsy_AP` (mật khẩu mặc định `12345678`).
+3. Mở `http://192.168.4.1`.
+4. Đặt camera thẳng mặt; giữ mắt mở, nhìn thẳng khoảng vài giây để hệ thống học baseline pitch/yaw.
+5. Thử nhắm mắt, ngáp và quay đầu để kiểm tra dashboard/buzzer/LED.
+
+## Console và API
+
+```text
+drowsy get
+drowsy set ear_blink_th 0.20
+drowsy stats
+drowsy reset
+drowsy bench start
+drowsy bench mark eyes_start
+drowsy bench stop
+drowsy alarm test microsleep
+drowsy alarm off
+```
+
+| Endpoint | Method | Công dụng |
 |---|---|---|
-| Camera board preset | ESP32-S3-EYE | S3-EYE / AI-Thinker / Custom (own 15 pins) |
-| Frame size | 240×240 | or QVGA 320×240 |
-| Camera RGB565 BE | n | enable if skin color is swapped (green/purple) |
-| Buzzer GPIO | 14 | free on S3-EYE |
-| LED GPIO | 21 | free on S3-EYE |
-| EAR blink th | 200 (0.20) | EAR below = eye closed |
-| EAR drowsy th | 160 (0.16) | sustained deep close |
-| MAR yawn th | 500 (0.50) | mouth open = yawn |
-| Microsleep ms | 1200 | sustained deep-close → emergency |
-| PERCLOS th | 400 (40%) | % closed in window → DROWSY |
-| Window ms | 60000 | PERCLOS sliding window |
-| Blink rate high | 20 | blinks/min contribute to fatigue |
-| Pitch dev th | 120 (0.12) | deviation from baseline → nodding |
-| Console enable | y | runtime `drowsy` commands |
-| Web enable | y | HTTP UI + stream + admin |
-| WiFi mode | AP | AP / STA / OFF |
-| AP SSID / pass | Drowsy_AP / 12345678 | hotspot (open or WPA2) |
-| WiFi SSID / pass (STA) | – | router credentials |
-| Admin pass | admin | for `/admin` |
-| HTTP port | 80 | page + stream + capture |
-| JPEG quality | 45 | stream quality |
-| Stream skip | 3 | send 1/N frames |
-| Report enable (needs STA) | y | POST state to server |
-| Report URL | – | e.g. `http://x:5000/api/report` |
-| **AI on device** | n | **see section “Source of state”** |
+| `/` | GET | Dashboard + MJPEG stream |
+| `/capture` | GET | Ảnh JPEG đơn |
+| `/status` | GET | Metrics và state JSON |
+| `/admin` | GET | Cấu hình thiết bị |
+| `/admin/api/config` | GET | Đọc/đổi cấu hình |
+| `/admin/api/reboot` | GET | Khởi động lại |
+| `/api/alarm` | POST | Gửi state alarm khi chạy chế độ offload |
+| `/api/ota` | POST | Nạp firmware OTA |
 
-### Source-of-truth (AI) configuration
-
-The `DROWSY_AI_ON_DEVICE` switch decides **who detects drowsiness**:
-
-| `AI_ON_DEVICE` | Behavior |
-|---|---|
-| `n` (default) | The **phone/app** is the source. ESP32 only streams frames + drives buzzer/LED when the app sends `POST /api/alarm`. No on-device face/landmap work → lightest CPU/RAM. |
-| `y`            | ESP32 runs the full **edge pipeline** itself (face detect + PFLD + state machine) and drives the buzzer/LED directly. Use when no phone is present. |
-
-The console `drowsy` commands (`get/set/stats/reset`) **also exist** and work at runtime.
-
----
-
-## 8. Runtime console
+## Cấu trúc repo
 
 ```text
-drowsy get                     # show all thresholds
-drowsy set ear_blink_th 0.22   # change threshold & save (NVS)
-drowsy set perclos_th 0.45
-drowsy stats                   # PERCLOS, blink/min, yawn/min, fatigue
-drowsy reset                   # reset baseline pitch + counters
+.
+├── docs/demo/                  # video và ảnh xem trước
+├── benchmark_results/          # ground truth + báo cáo benchmark
+├── main/
+│   ├── app_main.cpp            # camera/AI/alarm scheduling
+│   ├── face_pipeline.cpp       # ESPDet-Pico face detection
+│   ├── landmark_pfld.cpp       # PFLD + EAR/MAR/pitch/yaw
+│   ├── drowsiness_detector.cpp # fusion + PERCLOS + state machine
+│   ├── alarm_control.cpp       # buzzer/LED non-blocking
+│   ├── benchmark.cpp           # log BENCH tái lập được
+│   └── web_server.cpp          # dashboard, stream, API, OTA
+├── model/                      # ONNX và model .espdl nhúng firmware
+├── tools/                      # export/quantize/evaluate benchmark
+├── scripts/                    # tiện ích build/flash/stream Windows
+├── requirements.txt            # dependency Python tùy chọn, cài bằng pip
+├── dependencies.lock           # phiên bản component firmware được khóa
+├── .github/workflows/build.yml # CI build ESP-IDF 5.3.5
+├── partitions.csv              # hai OTA slot 4,5 MiB
+└── sdkconfig.defaults*         # cấu hình N16R8/PSRAM/camera
 ```
 
-### Calibration procedure (light-dependent)
+## Hạn chế và kế hoạch kiểm chứng tiếp theo
 
-1. Sit normally; look straight → log should show `ear ≈ 0.28 – 0.35`.
-2. Blink 3× → `blink/min` rises, no DROWSY.
-3. Close eyes for 2 s → must enter **MICROSLEEP** (buzzer continuous + LED on).
-4. Yawn → `yawn/min` rises.
-5. Nod head down → `pitch_dev` rises.
-6. If EAR is noisy in dark/glasses: increase `--calib-steps` when quantizing, try
-   `num_of_bits=16`, or lower resolution.
+- Benchmark hiện có một người thử, một camera và thời lượng ngắn.
+- Kính, ánh sáng yếu, che mặt và góc camera lớn có thể làm EAR/landmark nhiễu.
+- Cần chạy lại benchmark sau các fix ngày 12/09, thêm tối thiểu 15–30 phút tỉnh táo để đo false-alarm/hour.
+- Cần tập test nhiều người và benchmark A/B cùng video trên Raspberry Pi 5 nếu muốn công bố “accuracy tương đương”.
+- Khi dùng trên xe thật cần vỏ, nguồn ổn định, driver transistor cho buzzer lớn và đánh giá EMC/nhiệt/rung.
 
----
+## Nguồn và ghi công
 
-## 9. Web interface & API
+- **Giải pháp/repo gốc:** [phuongproduc — Driver Drowsiness Detection ESP32-S3](https://github.com/phuongproduc/Driver-Drowsiness-Detection-ESP32-S3-N16R8-ESP-WHO-ESP-DL-v3-PFLD-). Phiên bản này là phần phát triển tiếp theo và giữ liên kết nguồn để truy vết.
+- **ESP-DL:** [framework inference và quantization chính thức của Espressif](https://github.com/espressif/esp-dl).
+- **ESP-WHO:** [framework computer vision chính thức của Espressif](https://github.com/espressif/esp-who).
+- **ESP32-S3:** [datasheet chính thức](https://www.espressif.com/sites/default/files/documentation/esp32-s3_datasheet_en.pdf).
+- **PFLD:** Guo et al., [“PFLD: A Practical Facial Landmark Detector”](https://arxiv.org/abs/1902.10859).
+- **EAR:** Soukupová & Čech, [“Eye Blink Detection Using Facial Landmarks”](https://cmp.felk.cvut.cz/ftp/articles/cech/Soukupova-TR-2016-05.pdf).
+- **PERCLOS:** [NHTSA review of vehicle-based drowsiness sensors](https://static.nhtsa.gov/nhtsa/downloads/p2017-documents/811886-Assess_veh-based_sensors_4_drowsy-driving_detection.pdf).
+- **Raspberry Pi 5:** [trang sản phẩm/thông số chính thức](https://www.raspberrypi.com/products/raspberry-pi-5/) và [giá khởi điểm hiện hành](https://www.raspberrypi.com/products/).
 
-The HTTP server (port 80) exposes:
+## License và dữ liệu
 
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/` | GET | live dashboard page |
-| `/stream` | GET | MJPEG stream |
-| `/capture` | GET | single JPEG |
-| `/status` | GET | JSON metrics (EAR, MAR, PERCLOS, …) |
-| `/admin` | GET | admin panel (password) |
-| `/admin/api/config` | GET | view / change config (+ `?pass=`), reboot WiFi |
-| `/admin/api/reboot` | GET | reboot device |
-| `/admin/api/log` | GET | recent log ring |
-| `/api/alarm` | POST | body `{"state": 0..3}` → buzzer/LED (when `AI_ON_DEVICE=off`) |
-| `/api/ota` | POST | firmware `.bin` → OTA update |
-
----
-
-## 10. WiFi modes
-
-| Mode | Behavior |
-|---|---|
-| **AP** | device hosts `Drowsy_AP` (`12345678`) → open `http://192.168.4.1` |
-| **STA** | device joins a router; get IP from serial log (`WiFi connected: 192.168.x.x`) or via mDNS `drowsy.local` |
-| **OFF** | WiFi disabled |
-
-- Switching AP↔STA at runtime is done through the app (`DeviceApi.setDeviceWifi`) or
-  `/admin/api/config?pass=...&wifi_mode=...`.
-- If STA fails to connect **after 5 retries**, the firmware **automatically returns to AP**
-  mode so the device can never become unreachable.
-
----
-
-## 11. OTA firmware update
-
-OTA is enabled by the OTA partition layout:
-
-```text
-nvs,       … 0x6000
-phy_init,  … 0x1000
-otadata,   … 0x2000
-ota_0,     … 0x3C0000   (≈3.75 MB)
-ota_1,     … 0x3C0000
-```
-
-- **First flash** must be full (`flash`) — see §6.
-- New images are pushed to `POST /api/ota` (raw binary, `application/octet-stream`).
-- `idf.py size` will report whether the current build fits in a single OTA slot
-  (≈3.75 MB, models included).
-
-Example (curl):
-
-```bash
-curl -v -X POST http://192.168.4.1/api/ota \
-     -H "Content-Type: application/octet-stream" \
-     --data-binary @build/driver_drowsiness_detection.bin
-```
-
----
-
-## 12. Algorithms
-
-### Pipeline
-
-```text
-Frame RGB565 240×240
-  └─ face detect (custom) ─► largest face [x0,y0,x1,y1]
-       └─ PFLD 68 (crop → 112×112 → normalize → inference)
-            ├─ EAR = (|p2−p6| + |p3−p5|) / (2·|p1−p4|)   // Soukupová & Čech 2016
-            ├─ MAR = (height/width) of mouth after −roll derotation
-            └─ pitch = geometric ratio (nose/mouth), clamped [−1, 1]
-                 └─ PERCLOS + fatigue score + state machine → buzzer/LED
-```
-
-- **EAR**: standard Euclidean 6-point formula; **roll-invariant** (no explicit
-  derotate needed for the eye).
-- **MAR**: height/width of the mouth bounding box **after** rotating points by −roll.
-- **PERCLOS**: % of closed-eye samples in a sliding window (default 60 s).
-- **Blink/yawn rates**: real rates within the window.
-- **fatigue_score** =
-  `0.40·PERCLOS + 0.20·yawn + 0.20·pitch_dev + 0.20·blink_rate`.
-
-### State machine (hysteresis)
-
-```text
-AWAKE(0) ─► PRE_DROWSY(1) ─► DROWSY(2) ─► MICROSLEEP(3)
-   ▲               │              │              │
-   └───────────────┴──────────────┴──────────────┘ exit conditions
-```
-
-- Enter **MICROSLEEP** when the eye is deeply closed (`EAR < ear_drowsy`) continuously
-  for `microsleep_ms` (default 1200 ms).
-- Exit **MICROSLEEP → AWAKE** when `EAR >= ear_blink` **AND** `MAR <= mar_th`
-  (eyes open + mouth not open).
-- Exit **DROWSY → AWAKE** when `EAR >= ear_blink`.
-- (No dependence on a fragile “eye-open `since`” timer — thresholds are derived directly
-  from the live EAR/MAR.)
-
----
-
-## 13. Troubleshooting / FAQ
-
-| Symptom | Cause / fix |
-|---|---|
-| `Camera init failed 0x...` | wrong camera pins → choose preset or declare Custom (menuconfig) |
-| Build error: missing `.espdl` | models are vendored — check `model/`; else re-run quantization tool |
-| FPS low (< 3) | EAR closed → PFLD runs every frame; check `DROWSY_AI_ON_DEVICE`, cache/CPU config |
-| EAR always ~0 or noisy | landmark mapping wrong → run `tools/verify_pfld_mapping.py` |
-| Skin colors swapped (purple/green) | enable `DROWSY_CAM_RGB565_BE` (byte-order) |
-| Buzzer silent | check buzzer GPIO + driver current (needs transistor if > 5 mA) |
-| STA won't connect | router 5 GHz? ESP32 is 2.4 GHz only. 5. check SSID/pass. |
-| mDNS / auto-IP fails on Android | use AP fixed IP `192.168.4.1`; mDNS unreliable on no-internet N/W |
-| OTA fails | first flash must be full; check `idf.py size` fits slot; use `-p /dev/ttyACM0` |
-
----
-
-## 14. Optional companions (briefly)
-
-Two optional companion components exist in this repo:
-
-- **Android app** (`android/`) — a Jetpack Compose app that can:
-  - connect to the device (stream, metrics, thresholds),
-  - run its own (optional) AI (MediaPipe-based) for higher FPS on the phone,
-  - send alarms / notifications locally,
-  - then sync local log to a server via `SyncWorker`.
-- **Admin server** (`server/`) — a Flask + SQLite dashboard that accepts
-  `/api/report` from devices and `/api/sync` from the app; shows live state, history, GPS map.
-
-Deploy/run the app and the server **yourself** — this README focuses on the **edge model**.
-
----
-
-## 15. Licenses
-
-- Example code: MIT (like ESP-WHO).
-- Face-detect model: custom (self-trained).
-- PFLD model: self-trained, quantized from a PyTorch/ONNX origin (verify the license of
-  your training data / source model — WFLW used for research).
+Mã nguồn kế thừa phải tuân theo license của repo gốc và các dependency/model tương ứng. Hãy kiểm tra license của checkpoint/dataset trước khi thương mại hóa. Video demo thuộc người thực hiện dự án và được đưa vào repo làm minh chứng theo yêu cầu của chủ sở hữu.

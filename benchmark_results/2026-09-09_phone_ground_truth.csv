@@ -1,0 +1,10 @@
+label,start_ms,end_ms
+yawn,81500,84500
+yawn,90500,94000
+yawn,105000,110000
+yawn,131000,138500
+yawn,157000,164000
+eyes_closed,85500,90000
+eyes_closed,138000,154500
+distracted,116000,120500
+distracted,123000,130000

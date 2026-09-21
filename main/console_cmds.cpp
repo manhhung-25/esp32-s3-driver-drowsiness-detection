@@ -10,10 +10,14 @@
 
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+
+#include "benchmark.hpp"
 
 static const char *TAG = "console";
 
 static DrowsinessDetector *s_detector = NULL;
+static AlarmControl *s_alarm = NULL;
 static device_config_t *s_cfg = NULL; // fix C5: để `drowsy set` lưu NVS
 
 static const char *state_str(DrowsyState s)
@@ -23,6 +27,7 @@ static const char *state_str(DrowsyState s)
     case DrowsyState::PRE_DROWSY: return "PRE_DROWSY";
     case DrowsyState::DROWSY: return "DROWSY";
     case DrowsyState::MICROSLEEP: return "MICROSLEEP";
+    case DrowsyState::DISTRACTED: return "DISTRACTED";
     }
     return "?";
 }
@@ -56,7 +61,7 @@ static void fill_param_table(DrowsinessDetector *det)
 static int drowsy_cmd(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage: drowsy <get|set|stats|reset>\n");
+        printf("Usage: drowsy <get|set|stats|reset|bench|alarm>\n");
         return 0;
     }
     const char *sub = argv[1];
@@ -116,6 +121,10 @@ static int drowsy_cmd(int argc, char **argv)
         printf("  yawn/min    = %.1f (total %u)\n", s_detector->yawn_rate(), (unsigned)s_detector->yawn_count());
         printf("  pitch_dev   = %.3f\n", s_detector->pitch_dev());
         printf("  fatigue     = %.2f\n", s_detector->fatigue_score());
+        printf("  eyes        = %s\n", s_detector->eyes_closed() ? "CLOSED" : "OPEN");
+        printf("  yawning     = %s\n", s_detector->yawning() ? "YES" : "NO");
+        printf("  attention   = %s (%ums)\n", s_detector->attention_off() ? "OFF" : "ON",
+               (unsigned)s_detector->attention_off_ms());
         return 0;
     }
 
@@ -125,22 +134,73 @@ static int drowsy_cmd(int argc, char **argv)
         return 0;
     }
 
-    printf("Usage: drowsy <get|set|stats|reset>\n");
+    if (strcmp(sub, "bench") == 0) {
+        if (argc == 3 && strcmp(argv[2], "start") == 0) {
+            benchmark_set_enabled(true);
+            benchmark_mark("video_start", (uint64_t)(esp_timer_get_time() / 1000));
+            return 0;
+        }
+        if (argc == 3 && strcmp(argv[2], "stop") == 0) {
+            benchmark_mark("video_stop", (uint64_t)(esp_timer_get_time() / 1000));
+            benchmark_set_enabled(false);
+            return 0;
+        }
+        if (argc == 4 && strcmp(argv[2], "mark") == 0) {
+            benchmark_mark(argv[3], (uint64_t)(esp_timer_get_time() / 1000));
+            return 0;
+        }
+        printf("Usage: drowsy bench <start|stop|mark label>\n");
+        printf("Latency labels: eyes_start yawn_start distracted_start drowsy_start microsleep_start\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "alarm") == 0) {
+        if (s_alarm == NULL) {
+            printf("Alarm control is unavailable.\n");
+            return 1;
+        }
+        if (argc == 3 && strcmp(argv[2], "off") == 0) {
+            s_alarm->clear_test_state();
+            printf("Alarm test override OFF.\n");
+            return 0;
+        }
+        if (argc == 4 && strcmp(argv[2], "test") == 0) {
+            DrowsyState state = DrowsyState::AWAKE;
+            if (strcmp(argv[3], "predrowsy") == 0) state = DrowsyState::PRE_DROWSY;
+            else if (strcmp(argv[3], "drowsy") == 0) state = DrowsyState::DROWSY;
+            else if (strcmp(argv[3], "microsleep") == 0) state = DrowsyState::MICROSLEEP;
+            else if (strcmp(argv[3], "distracted") == 0) state = DrowsyState::DISTRACTED;
+            else {
+                printf("State: predrowsy | drowsy | microsleep | distracted\n");
+                return 1;
+            }
+            s_alarm->set_test_state(state);
+            printf("Alarm test ON: %s\n", argv[3]);
+            return 0;
+        }
+        printf("Usage: drowsy alarm test <predrowsy|drowsy|microsleep|distracted>\n");
+        printf("       drowsy alarm off\n");
+        return 0;
+    }
+
+    printf("Usage: drowsy <get|set|stats|reset|bench|alarm>\n");
     return 0;
 }
 
-void register_drowsy_commands(DrowsinessDetector *detector, device_config_t *config)
+void register_drowsy_commands(DrowsinessDetector *detector, device_config_t *config,
+                              AlarmControl *alarm)
 {
     s_detector = detector;
     s_cfg = config;
+    s_alarm = alarm;
     fill_param_table(detector);
 
     const esp_console_cmd_t cmd = {
         .command = "drowsy",
-        .help = "Drowsiness detector: get | set <param> <value> | stats | reset",
+        .help = "Drowsiness detector: get | set | stats | reset | bench",
         .hint = NULL,
         .func = &drowsy_cmd,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
-    ESP_LOGI(TAG, "Registered 'drowsy' command (get/set/stats/reset).");
+    ESP_LOGI(TAG, "Registered 'drowsy' command with benchmark controls.");
 }

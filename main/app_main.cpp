@@ -10,11 +10,13 @@
 // Console (USB-Serial/JTAG): `drowsy get/set/stats/reset`
 // ============================================================================
 
+#include <cstring>
 #include <vector>
 
 #include "esp_camera.h"
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_psram.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -23,6 +25,7 @@
 #include "dl_image_define.hpp"
 
 #include "alarm_control.hpp"
+#include "benchmark.hpp"
 #include "camera_utils.hpp"
 #include "config_store.hpp"
 #include "console_cmds.hpp"
@@ -44,6 +47,19 @@ static web_metrics_t s_web_metrics = {};
 static device_config_t s_device_config; // cấu hình NVS (admin panel)
 #if CONFIG_DROWSY_AI_ON_DEVICE
 static DrowsyState s_last_state = DrowsyState::AWAKE;
+static uint64_t s_state_since_ms = 0;
+
+static const char *drowsy_state_name(DrowsyState state)
+{
+    switch (state) {
+    case DrowsyState::AWAKE:      return "AWAKE";
+    case DrowsyState::PRE_DROWSY: return "PRE_DROWSY";
+    case DrowsyState::DROWSY:     return "DROWSY";
+    case DrowsyState::MICROSLEEP: return "MICROSLEEP";
+    case DrowsyState::DISTRACTED: return "DISTRACTED";
+    default:                      return "UNKNOWN";
+    }
+}
 #endif
 
 #if CONFIG_DROWSY_AI_ON_DEVICE
@@ -52,6 +68,25 @@ static LandmarkPFLD s_pfld;
 #endif
 static DrowsinessDetector s_detector;
 static AlarmControl s_alarm;
+
+#if CONFIG_DROWSY_AI_ON_DEVICE
+static float face_box_iou(const std::vector<int> &box, const int cached_box[4])
+{
+    if (box.size() < 4) return 0.0f;
+
+    const int ix1 = box[0] > cached_box[0] ? box[0] : cached_box[0];
+    const int iy1 = box[1] > cached_box[1] ? box[1] : cached_box[1];
+    const int ix2 = box[2] < cached_box[2] ? box[2] : cached_box[2];
+    const int iy2 = box[3] < cached_box[3] ? box[3] : cached_box[3];
+    const int iw = ix2 > ix1 ? ix2 - ix1 : 0;
+    const int ih = iy2 > iy1 ? iy2 - iy1 : 0;
+    const int intersection = iw * ih;
+    const int area_a = (box[2] - box[0]) * (box[3] - box[1]);
+    const int area_b = (cached_box[2] - cached_box[0]) * (cached_box[3] - cached_box[1]);
+    const int total = area_a + area_b - intersection;
+    return total > 0 ? (float)intersection / (float)total : 0.0f;
+}
+#endif
 
 // ---- Áp cấu hình NVS vào detector (ngưỡng) - lúc boot ----
 static void apply_config_to_detector(void)
@@ -125,8 +160,28 @@ static void ai_task(void *arg)
         // ---- 1. Face detection (MSR + MNP) - đo thời gian để chẩn đoán FPS ----
         int64_t t1 = esp_timer_get_time();
         std::vector<int> face_box, keypoints;
-        const bool has_face = s_face.detect(img, face_box, keypoints, &msr_cnt_last, &mnp_cnt_last);
-        face_ms_last = (int)((esp_timer_get_time() - t1) / 1000);
+        static std::vector<int> s_face_box_cache;
+        static int s_face_detect_skip = 0;
+        static int s_face_miss_skip = 0;
+        const bool run_face_detect = s_face_box_cache.empty()
+                                         ? (s_face_miss_skip++ % 2 == 0)
+                                         : (s_face_detect_skip++ % 4 == 0);
+        bool has_face = false;
+        if (run_face_detect) {
+            has_face = s_face.detect(img, face_box, keypoints, &msr_cnt_last, &mnp_cnt_last);
+            face_ms_last = (int)((esp_timer_get_time() - t1) / 1000);
+            if (has_face) {
+                s_face_box_cache = face_box;
+            } else {
+                s_face_box_cache.clear();
+            }
+        } else {
+            has_face = true;
+            face_box = s_face_box_cache;
+            face_ms_last = 0;
+            msr_cnt_last = 0;
+            mnp_cnt_last = 0;
+        }
 
         // ---- 2. Landmark PFLD + EAR/MAR/pitch ----
         // PFLD mất ~519ms -> chạy CÁCH QUÃNG (mỗi 2 frame), frame xen kẽ dùng
@@ -134,7 +189,10 @@ static void ai_task(void *arg)
         // fix B3: khi skip nhưng CHƯA có cache hợp lệ (frame đầu) -> vẫn chạy PFLD
         // để có metric ngay (tránh mất mẫu đầu -> mất cảnh báo đầu tiên).
         static FaceMetrics s_metrics_cache;
+        static float s_landmarks_cache[PFLD_NUM_POINTS * 2] = {};
+        static int s_landmark_face_box[4] = {};
         static bool s_metrics_valid = false;
+        static bool s_landmarks_valid = false;
         static int s_pfld_skip = 0;
         FaceMetrics m;
         bool metrics_ok = false;
@@ -146,17 +204,29 @@ static void ai_task(void *arg)
         // fix NEW-3: khi MẤT mặt -> reset cache để face quay lại không dùng metric cũ
         if (!has_face) {
             s_metrics_valid = false;
+            s_landmarks_valid = false;
+            s_face_box_cache.clear();
+        } else if (s_landmarks_valid && face_box_iou(face_box, s_landmark_face_box) < 0.45f) {
+            // A new face or detector jump must not inherit old landmarks.
+            s_metrics_valid = false;
+            s_landmarks_valid = false;
         }
         // fix NEW-1: khi EAR cache thấp (đang nhắm mắt - nghi microsleep) -> chạy
         // PFLD mỗi frame để bắt chính xác thời điểm nhắm (không trễ 1s vì skip).
-        bool low_ear = s_metrics_valid && s_metrics_cache.ear < s_detector.params().ear_blink_th;
-        bool run_pfld = (s_pfld_skip++ % 3 == 0) || !s_metrics_valid || low_ear;
+        const int pfld_period = (s_detector.eyes_closed() || s_detector.yawning()) ? 2 : 3;
+        bool run_pfld = (s_pfld_skip++ % pfld_period == 0) || !s_metrics_valid;
         if (has_face && run_pfld &&
             s_pfld.run(img, face_box, landmarks)) {
             pfld_ran = true; // PFLD thực sự chạy frame này
             if (compute_face_metrics(landmarks, &m)) {
                 s_metrics_cache = m;
                 s_metrics_valid = true;
+                std::memcpy(s_landmarks_cache, landmarks, sizeof(s_landmarks_cache));
+                for (int i = 0; i < 4; ++i) {
+                    s_landmark_face_box[i] = face_box[i];
+                }
+                s_landmarks_valid = true;
+                metrics_ok = true;
             }
         } else if (has_face && s_metrics_valid) {
             m = s_metrics_cache; // frame skip: dùng metric gần nhất
@@ -172,7 +242,25 @@ static void ai_task(void *arg)
         // mắt (tránh false positive).
 
         // ---- 3. State machine (landmark không hợp lệ -> xem như không có mặt) ----
-        const DrowsyState st = s_detector.update(has_face && metrics_ok, m.ear, m.mar, m.pitch, now_ms);
+        const DrowsyState st = s_detector.update(has_face && metrics_ok, m.ear, m.mar, m.pitch, m.yaw, now_ms);
+        if (s_state_since_ms == 0) {
+            s_state_since_ms = now_ms;
+            s_last_state = st;
+        } else if (st != s_last_state) {
+            const uint64_t previous_state_ms = now_ms - s_state_since_ms;
+            ESP_LOGI(TAG,
+                     "ALERT_DETECT,state=%s,from=%s,t_ms=%llu,previous_state_ms=%llu,face=%d,ear=%.3f,mar=%.3f,yaw_dev=%.3f",
+                     drowsy_state_name(st), drowsy_state_name(s_last_state),
+                     (unsigned long long)now_ms,
+                     (unsigned long long)previous_state_ms,
+                     (has_face && metrics_ok) ? 1 : 0, m.ear, m.mar, s_detector.yaw_dev());
+            s_last_state = st;
+            s_state_since_ms = now_ms;
+        }
+
+        benchmark_log_sample(now_ms, has_face, metrics_ok, s_detector.eyes_closed(),
+                             s_detector.yawning(), s_detector.attention_off(), (int)st,
+                             m.ear, m.mar, s_detector.yaw_dev());
 
 #if CONFIG_DROWSY_WEB_ENABLE
         if (st != s_last_state) {
@@ -182,27 +270,59 @@ static void ai_task(void *arg)
 #endif
 
         // ---- 4. Gửi lệnh cảnh báo (0 timeout: alarm task giữ trạng thái mới nhất) ----
-        alarm_event_t ev = {st};
+        // Eye/yawn flags are immediate actuator evidence. The detector state
+        // remains hysteretic for stable UI/fatigue reporting, but the alarm
+        // must not wait for the long-term drowsiness state to change.
+        DrowsyState alarm_state = DrowsyState::AWAKE;
+        const bool direct_eye_alert = s_detector.eyes_closed();
+        const bool direct_yawn_alert = s_detector.yawning();
+        const bool direct_attention_alert = s_detector.attention_off();
+        if (direct_eye_alert || direct_yawn_alert) {
+            alarm_state = st == DrowsyState::MICROSLEEP
+                              ? DrowsyState::MICROSLEEP
+                              : DrowsyState::DROWSY;
+        } else if (direct_attention_alert) {
+            alarm_state = DrowsyState::DISTRACTED;
+        }
+        static DrowsyState s_last_alarm_state = DrowsyState::AWAKE;
+        if (alarm_state != s_last_alarm_state) {
+            ESP_LOGI(TAG, "ALARM_TRIGGER,detector_state=%d,alarm_state=%d,eye=%d,yawn=%d,attention=%d",
+                     (int)st, (int)alarm_state, direct_eye_alert ? 1 : 0,
+                     direct_yawn_alert ? 1 : 0, direct_attention_alert ? 1 : 0);
+            s_last_alarm_state = alarm_state;
+        }
+        alarm_event_t ev = {alarm_state};
         xQueueSend(s_alarm_queue, &ev, 0);
 
 #if CONFIG_DROWSY_WEB_ENABLE
         // ---- 4b. Web: cập nhật metrics + vẽ overlay + gửi frame cho web task ----
         // fix M2: ghi metrics dưới spinlock (httpd/report đọc ở Core 0)
         web_metrics_lock();
-        s_web_metrics.state = (int)st;
+        s_web_metrics.state = (int)alarm_state;
         s_web_metrics.ear = m.ear;
         s_web_metrics.mar = m.mar;
         s_web_metrics.pitch = m.pitch;
         s_web_metrics.pitch_dev = s_detector.pitch_dev();
+        s_web_metrics.yaw_dev = s_detector.yaw_dev();
+        s_web_metrics.yaw_baseline = s_detector.yaw_baseline();
         s_web_metrics.perclos = s_detector.perclos();
         s_web_metrics.blink_rate = s_detector.blink_rate();
         s_web_metrics.yawn_rate = s_detector.yawn_rate();
         s_web_metrics.fatigue = s_detector.fatigue_score();
         s_web_metrics.face = has_face ? 1 : 0;
         s_web_metrics.metrics_ok = metrics_ok ? 1 : 0;
+        s_web_metrics.eyes_closed = s_detector.eyes_closed() ? 1 : 0;
+        s_web_metrics.yawn_active = s_detector.yawning() ? 1 : 0;
+        s_web_metrics.attention_off = s_detector.attention_off() ? 1 : 0;
+        s_web_metrics.attention_off_ms = s_detector.attention_off_ms();
         web_metrics_unlock();
+        web_cache_overlay(has_face ? face_box.data() : nullptr,
+                          s_landmarks_valid ? s_landmarks_cache : nullptr,
+                          PFLD_NUM_POINTS, metrics_ok && s_landmarks_valid);
         if (has_face) {
-            web_draw_overlay(fb, face_box.data(), landmarks, metrics_ok, &s_web_metrics);
+            web_draw_overlay(fb, face_box.data(),
+                             s_landmarks_valid ? s_landmarks_cache : nullptr,
+                             metrics_ok && s_landmarks_valid, &s_web_metrics);
         }
         // QUAN TRỌNG: nếu web queue đầy (chưa có client) -> PHẢI fb_return ngay
         // nếu không sẽ rò frame buffer -> camera hết buffer -> hệ thống treo!
@@ -231,7 +351,7 @@ static void ai_task(void *arg)
             const float fps = frames * 1000.0f / (float)elapsed_ms;
 #if CONFIG_DROWSY_WEB_ENABLE
             web_metrics_lock(); // fix M2
-            s_web_metrics.fps = fps;
+            s_web_metrics.ai_fps = fps;
             web_metrics_unlock();
 #endif
             // face/metrics_ok/roll + face_ms/pfld_ms dùng để DEBUG (face=0, FPS thấp)
@@ -254,10 +374,8 @@ static void ai_task(void *arg)
         // fix WDT: với fb_count=4, ai_task chạy LIÊN TỤC 100% CPU1 (s_frame_queue
         // không bao giờ rỗng -> xQueueReceive không block) -> IDLE1 (prio 0) bị
         // starve -> Task WDT trigger. Nhường CPU để IDLE1 chạy và reset watchdog.
-        // QUAN TRỌNG (sửa): KHÔNG được dùng pdMS_TO_TICKS(1) vì tại
-        // CONFIG_FREERTOS_HZ=100, 1ms -> 0 tick -> vTaskDelay(0) không block,
-        // IDLE1 vẫn bị starve -> WDT vẫn fire. Phải delay 1 tick THẬT = 10ms:
-        vTaskDelay(pdMS_TO_TICKS(10)); // = 1 tick @100Hz = 10ms (~3% CPU, không đáng kể)
+        // Nhường CPU 1 tick (10ms) để IDLE1 reset Task WDT và WiFi/httpd xử lý mượt hơn
+        vTaskDelay(1);
     }
 }
 
@@ -312,6 +430,10 @@ extern "C" void app_main(void)
     // Chỉ khi ESP32 là nguồn (edge AI on). Nếu offload (app là nguồn) ->
     // không cần face/PFLD -> tiết kiệm RAM/CPU.
 #if CONFIG_DROWSY_AI_ON_DEVICE
+    if (!esp_psram_is_initialized()) {
+        ESP_LOGE(TAG, "PSRAM is unavailable. This N16R8 firmware requires 8 MB Octal PSRAM.");
+        return;
+    }
     if (!s_face.init()) {
         ESP_LOGE(TAG, "Face detection model init FAILED!");
         return;
@@ -326,7 +448,16 @@ extern "C" void app_main(void)
     s_alarm_queue = s_alarm.init();
 
     // ---- 3. Camera: RGB565, 240x240 (Kconfig), PSRAM ----
-    s_frame_queue = xQueueCreate(3, sizeof(camera_fb_t *));
+    // AI only needs the newest frame; a one-item queue prevents it from
+    // accumulating old work while the camera keeps the web stream moving.
+    s_frame_queue = xQueueCreate(1, sizeof(camera_fb_t *));
+#if CONFIG_DROWSY_WEB_ENABLE
+    s_web_frame_queue = xQueueCreate(3, sizeof(camera_fb_t *));
+    if (s_web_frame_queue == NULL) {
+        ESP_LOGE(TAG, "Web frame queue allocation failed");
+        return;
+    }
+#endif
     const pixformat_t pix = PIXFORMAT_RGB565;
     const framesize_t fsize =
 #if CONFIG_DROWSY_FRAME_SIZE_QVGA
@@ -339,7 +470,13 @@ extern "C" void app_main(void)
     // fb_get() block -> s_frame_queue trống -> AI chờ (wait_ms ~1900ms, FPS tụt).
     // 4 buffer: camera luôn có buffer trống, AI không bao giờ chờ frame.
     // Tốn thêm 2x240x240x2 = 230KB PSRAM (N16R8 có 8MB - dư dả).
-    if (!register_camera(pix, fsize, 4, s_frame_queue)) {
+    if (!register_camera(pix, fsize, 6, s_frame_queue,
+#if CONFIG_DROWSY_WEB_ENABLE
+                         s_web_frame_queue
+#else
+                         NULL
+#endif
+                         )) {
         ESP_LOGE(TAG, "Camera init FAILED - kiểm tra pin trong menuconfig!");
         return;
     }
@@ -347,7 +484,6 @@ extern "C" void app_main(void)
     // ---- 4. Áp ngưỡng NVS vào detector + web server (Core 1) ----
     apply_config_to_detector();
 #if CONFIG_DROWSY_WEB_ENABLE
-    s_web_frame_queue = xQueueCreate(2, sizeof(camera_fb_t *));
     web_server_init(s_web_frame_queue, &s_web_metrics, &s_detector, &s_device_config);
     // fix offload: app gửi POST /api/alarm -> ESP32 bật buzzer/LED
     web_server_set_alarm_queue(s_alarm_queue);
@@ -367,12 +503,20 @@ extern "C" void app_main(void)
 
     // ---- 5. Console runtime: drowsy get/set/stats/reset ----
 #if CONFIG_DROWSY_CONSOLE_ENABLE
-    register_drowsy_commands(&s_detector, &s_device_config); // fix C5: console lưu NVS
+    register_drowsy_commands(&s_detector, &s_device_config, &s_alarm); // console + alarm test
     esp_console_repl_config_t repl_cfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_cfg.prompt = "drowsy>";
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    // The board exposes the monitor on USB Serial/JTAG. Use that same RX path
+    // for interactive commands instead of UART0, whose RX is not on COM7.
     esp_console_dev_usb_serial_jtag_config_t hw_cfg = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
     esp_console_repl_t *repl = NULL;
     ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_cfg, &repl_cfg, &repl));
+#else
+    esp_console_dev_uart_config_t hw_cfg = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    esp_console_repl_t *repl = NULL;
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_cfg, &repl_cfg, &repl));
+#endif
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 #endif
 

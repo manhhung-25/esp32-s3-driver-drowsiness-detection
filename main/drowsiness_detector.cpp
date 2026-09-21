@@ -5,6 +5,10 @@
 #include "drowsiness_detector.hpp"
 
 #include <algorithm>
+#include <math.h>
+#include "esp_log.h"
+
+static const char *TAG = "eye_timing";
 
 // Hằng số nội bộ (không cần chỉnh ngoài Kconfig)
 #define BLINK_MAX_MS      800u   // nhắm mắt > 800ms không tính là blink (ngủ gật)
@@ -16,6 +20,9 @@
 
 DrowsinessDetector::DrowsinessDetector()
 {
+    m_params.distract_yaw_th = CONFIG_DROWSY_DISTRACT_YAW_TH / 1000.0f;
+    m_params.distract_ms = CONFIG_DROWSY_DISTRACT_MS;
+    m_params.face_lost_ms = CONFIG_DROWSY_FACE_LOST_MS;
     // Nạp giá trị mặc định từ Kconfig (menuconfig) - vẫn chỉnh runtime được.
     // LƯU Ý: Kconfig KHÔNG có kiểu float -> ngưỡng dạng tỷ lệ lưu dạng int
     // ĐƠN VỊ MILLI (x1000) -> chia /1000 khi nạp vào tham số float.
@@ -35,6 +42,7 @@ void DrowsinessDetector::reset()
     m_state = DrowsyState::AWAKE;
     m_eye_closed = false;
     m_eye_deep_closed = false;
+    m_eye_seen = false;
     m_closed_since = 0;
     m_deep_closed_since = 0;
     m_open_since = 0;
@@ -46,9 +54,20 @@ void DrowsinessDetector::reset()
     m_yawn_start = 0;
     m_yawn_armed = false;
     m_yawn_hist_n = 0;
+    m_attention_off = false;
+    m_attention_off_since = 0;
+    m_face_missing_since = 0;
+    m_yaw_baseline = 0;
+    m_yaw_acc = 0;
+    m_yaw_filtered = 0;
+    m_yaw_dev = 0;
+    m_yaw_n = 0;
+    m_yaw_ready = false;
+    m_yaw_filter_valid = false;
     m_sample_idx = 0;
     m_sample_count = 0;
     m_pitch_baseline = 0.35f;
+    m_pitch_ready = false;
     m_pitch_acc = 0;
     m_pitch_n = 0;
     m_pitch_dev = 0;
@@ -85,6 +104,13 @@ float DrowsinessDetector::yawn_rate() const
         if (m_yawn_times[i] >= start) cnt++;
     }
     return cnt * 60000.0f / (float)window;
+}
+
+uint32_t DrowsinessDetector::attention_off_ms() const
+{
+    if (!m_attention_off || m_last_update_ms < m_attention_off_since) return 0;
+    const uint64_t elapsed = m_last_update_ms - m_attention_off_since;
+    return elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed;
 }
 
 // ---- Ghi mẫu "mắt nhắm?" vào ring buffer cho PERCLOS ----
@@ -127,13 +153,57 @@ void DrowsinessDetector::update_fatigue(uint64_t now_ms)
                       0.20f * pitch_norm + 0.20f * blink_norm;
 }
 
-DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar, float pitch, uint64_t now_ms)
+DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar, float pitch, float yaw, uint64_t now_ms)
 {
     m_last_ear = ear;
     m_last_mar = mar;
     m_last_update_ms = now_ms;
 
-    // ---------- 1. Cập nhật trạng thái mắt ----------
+    // ---------- 1. Attention: yaw relative to the driver's centered baseline ----------
+    // PFLD's raw nose offset varies with camera placement and facial geometry. Learn the
+    // centered pose first, then evaluate a filtered deviation instead of absolute yaw.
+    if (face_detected && isfinite(yaw)) {
+        if (!m_yaw_filter_valid) {
+            m_yaw_filtered = yaw;
+            m_yaw_filter_valid = true;
+        } else {
+            m_yaw_filtered += 0.35f * (yaw - m_yaw_filtered);
+        }
+        m_face_missing_since = 0;
+
+        const bool centered_sample = !m_eye_closed && ear >= m_params.ear_blink_th &&
+                                    mar <= m_params.mar_th;
+        if (!m_yaw_ready && centered_sample) {
+            m_yaw_acc += m_yaw_filtered;
+            if (++m_yaw_n >= 20) {
+                m_yaw_baseline = m_yaw_acc / (float)m_yaw_n;
+                m_yaw_ready = true;
+            }
+        } else if (m_yaw_ready && centered_sample &&
+                   fabsf(m_yaw_filtered - m_yaw_baseline) < m_params.distract_yaw_th * 0.5f) {
+            m_yaw_baseline += 0.01f * (m_yaw_filtered - m_yaw_baseline);
+        }
+        m_yaw_dev = m_yaw_ready ? fabsf(m_yaw_filtered - m_yaw_baseline) : 0.0f;
+    } else {
+        if (m_face_missing_since == 0) m_face_missing_since = now_ms;
+        m_yaw_dev = 0.0f;
+    }
+
+    const bool face_missing = !face_detected &&
+                              (now_ms - m_face_missing_since) >= m_params.face_lost_ms;
+    const bool yaw_away = face_detected && m_yaw_ready &&
+                          m_yaw_dev >= m_params.distract_yaw_th;
+    const bool attention_now_off = face_missing || yaw_away;
+    if (attention_now_off) {
+        if (!m_attention_off) {
+            m_attention_off_since = face_missing ? m_face_missing_since : now_ms;
+        }
+        m_attention_off = true;
+    } else {
+        m_attention_off = false;
+        m_attention_off_since = 0;
+    }
+
     if (!face_detected) {
         // Mất mặt: không tính là nhắm mắt (tránh false positive khi quay đầu).
         // KHÔNG reset m_open_since ở đây — chỉ reset khi thực sự quan sát mắt MỞ
@@ -143,18 +213,30 @@ DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar,
         m_eye_deep_closed = false;
         push_perclos_sample(false, now_ms);
         update_fatigue(now_ms);
+        if (m_state != DrowsyState::MICROSLEEP && m_state != DrowsyState::DROWSY &&
+            attention_off_ms() >= m_params.distract_ms) {
+            m_state = DrowsyState::DISTRACTED;
+        }
         return m_state;
     }
 
     bool closed = (ear < m_params.ear_blink_th);
     bool deep_closed = (ear < m_params.ear_drowsy_th);
+    const bool was_closed = m_eye_closed;
 
     // ---- blink detection (đóng mở nhanh) ----
     if (closed && !m_eye_closed) {
         m_blink_armed = true;
         m_blink_start = now_ms;
+        m_closed_since = now_ms;
+        ESP_LOGI(TAG, "EYE_DETECT,CLOSED,t_ms=%llu,ear=%.3f",
+                 (unsigned long long)now_ms, ear);
     } else if (!closed && m_eye_closed && m_blink_armed) {
         uint64_t dur = now_ms - m_blink_start;
+        ESP_LOGI(TAG, "EYE_DETECT,OPEN,t_ms=%llu,ear=%.3f,closed_ms=%llu,blink=%d",
+                 (unsigned long long)now_ms, ear,
+                 (unsigned long long)(m_closed_since ? now_ms - m_closed_since : dur),
+                 (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS) ? 1 : 0);
         if (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS) {
             m_blink_count++;
             // fix B2: lưu timestamp để tính rate trong cửa sổ (ring nhỏ)
@@ -167,6 +249,10 @@ DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar,
             }
         }
         m_blink_armed = false;
+    } else if (!closed && !m_eye_seen) {
+        // Ghi nhận trạng thái ban đầu để terminal cho biết hệ thống đã thấy mắt mở.
+        ESP_LOGI(TAG, "EYE_DETECT,OPEN,t_ms=%llu,ear=%.3f,closed_ms=0,blink=0",
+                 (unsigned long long)now_ms, ear);
     }
 
     // ---- theo dõi nhắm sâu (microsleep) ----
@@ -176,15 +262,14 @@ DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar,
         }
     }
     if (closed) {
-        if (!m_eye_closed) {
-            m_closed_since = now_ms;
-        }
-    } else {
+        // m_closed_since được gán tại nhánh chuyển sang CLOSED ở trên.
+    } else if (was_closed || m_open_since == 0) {
         m_open_since = now_ms;
     }
 
     m_eye_closed = closed;
     m_eye_deep_closed = deep_closed;
+    m_eye_seen = true;
 
     // ---- yawn detection (miệng mở lâu) ----
     bool mouth_open = (mar > m_params.mar_th);
@@ -206,16 +291,17 @@ DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar,
     }
 
     // ---------- 2. Pitch baseline (chỉ học khi tỉnh táo) ----------
-    if (m_state == DrowsyState::AWAKE && !closed) {
-        m_pitch_acc += pitch;
-        m_pitch_n++;
-        if (m_pitch_n >= 300) {
-            m_pitch_baseline = m_pitch_acc / m_pitch_n;
-            m_pitch_acc = 0;
-            m_pitch_n = 0;
+    if (!m_pitch_ready && !closed && !mouth_open && isfinite(pitch)) {
+        m_pitch_baseline = pitch;
+        m_pitch_ready = true;
+    } else if (m_pitch_ready && m_state == DrowsyState::AWAKE &&
+               !closed && !mouth_open && !m_attention_off && isfinite(pitch)) {
+        // Adapt slowly to normal seating/camera shifts without learning a nod.
+        if (fabsf(pitch - m_pitch_baseline) < m_params.pitch_dev_th) {
+            m_pitch_baseline += 0.01f * (pitch - m_pitch_baseline);
         }
     }
-    m_pitch_dev = (pitch - m_pitch_baseline) < 0 ? (m_pitch_baseline - pitch) : (pitch - m_pitch_baseline);
+    m_pitch_dev = m_pitch_ready ? fabsf(pitch - m_pitch_baseline) : 0.0f;
 
     // ---------- 3. PERCLOS + fatigue score ----------
     push_perclos_sample(closed, now_ms);
@@ -230,7 +316,7 @@ DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar,
     case DrowsyState::AWAKE:
         if (microsleep) {
             m_state = DrowsyState::MICROSLEEP;
-        } else if (m_fatigue_score >= 0.6f) {
+        } else if (m_pitch_ready && m_fatigue_score >= 0.6f) {
             m_state = DrowsyState::PRE_DROWSY;
         }
         break;
@@ -240,7 +326,8 @@ DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar,
             m_state = DrowsyState::MICROSLEEP;
         } else if (m_perclos >= m_params.perclos_th || yawn_rate() >= 3.0f) {
             m_state = DrowsyState::DROWSY;
-        } else if (m_fatigue_score < 0.3f && eyes_open_since >= 5000u) {
+        } else if (!closed && !mouth_open && !m_attention_off &&
+                   m_fatigue_score < 0.45f && eyes_open_since >= 1000u) {
             m_state = DrowsyState::AWAKE;
         }
         break;
@@ -255,6 +342,14 @@ DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar,
         }
         break;
 
+    case DrowsyState::DISTRACTED:
+        if (microsleep) {
+            m_state = DrowsyState::MICROSLEEP;
+        } else if (!m_attention_off) {
+            m_state = m_fatigue_score >= 0.6f ? DrowsyState::PRE_DROWSY : DrowsyState::AWAKE;
+        }
+        break;
+
     case DrowsyState::MICROSLEEP:
         // fix treo: thoát MICROSLEEP dựa trực tiếp EAR + MAR (không dùng timer).
         // - Mắt MỞ lại: EAR >= ear_blink_th
@@ -264,6 +359,11 @@ DrowsyState DrowsinessDetector::update(bool face_detected, float ear, float mar,
             m_state = DrowsyState::AWAKE;
         }
         break;
+    }
+
+    if (m_state != DrowsyState::MICROSLEEP && m_state != DrowsyState::DROWSY &&
+        m_attention_off && attention_off_ms() >= m_params.distract_ms) {
+        m_state = DrowsyState::DISTRACTED;
     }
 
     return m_state;

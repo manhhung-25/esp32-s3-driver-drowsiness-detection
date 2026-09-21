@@ -30,7 +30,8 @@ extern "C" {
 bool register_camera(const pixformat_t pixel_format,
                      const framesize_t frame_size,
                      const uint8_t fb_count,
-                     const QueueHandle_t frame_o);
+                     const QueueHandle_t ai_frame_o,
+                     const QueueHandle_t stream_frame_o);
 
 #ifdef __cplusplus
 }

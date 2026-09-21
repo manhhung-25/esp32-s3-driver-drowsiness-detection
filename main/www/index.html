@@ -19,7 +19,7 @@
 <h2>&#128663; Driver Drowsiness Monitor</h2>
 <div class="row">
   <div>
-    <img id="stream" src="/stream" alt="stream">
+    <img id="stream" alt="stream">
     <p><button onclick="capture()">&#128247; Chụp ảnh</button></p>
   </div>
   <div>
@@ -27,6 +27,7 @@
   </div>
 </div>
 <script>
+document.getElementById('stream').src = 'http://' + location.hostname + ':81/stream';
 async function refresh() {
   try {
     const r = await fetch('/status');
@@ -36,12 +37,18 @@ async function refresh() {
       '<tr><th colspan="2" class="' + cls + '">TRẠNG THÁI: ' + j.state + '</th></tr>' +
       '<tr><td>EAR (độ mở mắt)</td><td>' + j.ear.toFixed(3) + '</td></tr>' +
       '<tr><td>MAR (độ mở miệng)</td><td>' + j.mar.toFixed(3) + '</td></tr>' +
+      '<tr><td>Mắt</td><td>' + (j.eyes_closed ? 'Nhắm' : 'Mở') + '</td></tr>' +
+      '<tr><td>Ngáp hiện tại</td><td>' + (j.yawn_active ? 'Có' : 'Không') + '</td></tr>' +
       '<tr><td>Pitch dev</td><td>' + j.pitch_dev.toFixed(3) + '</td></tr>' +
+      '<tr><td>Yaw lệch</td><td>' + j.yaw_dev.toFixed(3) + '</td></tr>' +
+      '<tr><td>Mốc yaw</td><td>' + j.yaw_baseline.toFixed(3) + '</td></tr>' +
       '<tr><td>PERCLOS</td><td>' + j.perclos.toFixed(0) + '%</td></tr>' +
       '<tr><td>Blink/phút</td><td>' + j.blink_min.toFixed(1) + '</td></tr>' +
       '<tr><td>Ngáp/phút</td><td>' + j.yawn_min.toFixed(1) + '</td></tr>' +
       '<tr><td>Fatigue</td><td>' + j.fatigue.toFixed(2) + '</td></tr>' +
-      '<tr><td>FPS</td><td>' + j.fps.toFixed(1) + '</td></tr>' +
+      '<tr><td>Mất tập trung</td><td>' + (j.attention_off ? (j.attention_off_ms / 1000).toFixed(1) + 's' : 'Không') + '</td></tr>' +
+      '<tr><td>CAM FPS</td><td>' + j.fps.toFixed(1) + '</td></tr>' +
+      '<tr><td>AI FPS</td><td>' + j.ai_fps.toFixed(1) + '</td></tr>' +
       '<tr><td>Khuôn mặt</td><td>' + (j.face ? 'Có' : 'Không') + '</td></tr>' +
       '<tr><td>Landmark OK</td><td>' + (j.metrics_ok ? 'Có' : 'Không') + '</td></tr>';
   } catch (e) {

@@ -4,13 +4,32 @@
 // ============================================================================
 
 #include "camera_utils.hpp"
+#include "web_server.hpp"
 
 #include "esp_log.h"
 #include "freertos/task.h"
 
 static const char *TAG = "camera_utils";
 
-static QueueHandle_t s_frame_queue = NULL;
+static QueueHandle_t s_ai_frame_queue = NULL;
+static QueueHandle_t s_stream_frame_queue = NULL;
+
+static void queue_latest(QueueHandle_t queue, camera_fb_t *frame)
+{
+    if (queue == NULL) {
+        esp_camera_fb_return(frame);
+        return;
+    }
+    if (xQueueSend(queue, &frame, 0) == pdTRUE) return;
+
+    camera_fb_t *stale = NULL;
+    if (xQueueReceive(queue, &stale, 0) == pdTRUE && stale != NULL) {
+        esp_camera_fb_return(stale);
+    }
+    if (xQueueSend(queue, &frame, 0) != pdTRUE) {
+        esp_camera_fb_return(frame);
+    }
+}
 
 // ---- Map preset board -> pin (dựa trên esp32-camera v2.0.x who_camera.h) ----
 #if CONFIG_DROWSY_CAM_MODULE_ESP32_S3_EYE
@@ -66,16 +85,24 @@ static QueueHandle_t s_frame_queue = NULL;
 #define CAM_PIN_PCLK   CONFIG_DROWSY_CAM_PIN_PCLK
 #endif
 
-#define XCLK_FREQ_HZ 10000000 // QUAY LẠI 10MHz: cấu hình ĐÃ CHẠY ỔN ĐỊNH 9.9 FPS (20MHz làm heap corrupt)
+#define XCLK_FREQ_HZ 20000000 // 20MHz cho OV2640 tăng tốc DMA capture
 
 // Task đẩy frame từ camera vào queue (pinned Core 0 - camera DMA/D2D)
 static void camera_task(void *arg)
 {
+    uint32_t frame_number = 0;
     while (true) {
         camera_fb_t *frame = esp_camera_fb_get();
         if (frame) {
             // Queue đầy -> chờ (backpressure tự nhiên, không drop đột ngột)
-            xQueueSend(s_frame_queue, &frame, portMAX_DELAY);
+            web_note_camera_frame();
+            const bool sample_for_ai = (frame_number++ % CONFIG_DROWSY_AI_SAMPLE_EVERY_N) == 0;
+            if (sample_for_ai && xQueueSend(s_ai_frame_queue, &frame, 0) == pdTRUE) {
+                continue;
+            }
+
+            web_draw_cached_overlay(frame);
+            queue_latest(s_stream_frame_queue, frame);
         }
     }
 }
@@ -83,7 +110,8 @@ static void camera_task(void *arg)
 bool register_camera(const pixformat_t pixel_format,
                      const framesize_t frame_size,
                      const uint8_t fb_count,
-                     const QueueHandle_t frame_o)
+                     const QueueHandle_t ai_frame_o,
+                     const QueueHandle_t stream_frame_o)
 {
     // ---- ESP32-CAM board: GPIO13/14 mặc định là JTAG, phải chuyển sang input ----
 #if CONFIG_DROWSY_CAM_MODULE_AI_THINKER
@@ -148,7 +176,8 @@ bool register_camera(const pixformat_t pixel_format,
         }
     }
 
-    s_frame_queue = frame_o;
+    s_ai_frame_queue = ai_frame_o;
+    s_stream_frame_queue = stream_frame_o;
     // Task camera trên Core 0 - AI pipeline chạy Core 1, không cạnh tranh nhau
     xTaskCreatePinnedToCore(camera_task, "camera_task", 3 * 1024, NULL, 5, NULL, 0);
     ESP_LOGI(TAG, "Camera ready.");

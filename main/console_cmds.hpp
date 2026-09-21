@@ -6,6 +6,7 @@
 
 #include "drowsiness_detector.hpp"
 #include "config_store.hpp"
+#include "alarm_control.hpp"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,7 +21,8 @@ extern "C" {
  *   drowsy stats                    -> in PERCLOS, blink/min, yawn/min, fatigue
  *   drowsy reset                    -> reset state machine + baseline pitch
  */
-void register_drowsy_commands(DrowsinessDetector *detector, device_config_t *config);
+void register_drowsy_commands(DrowsinessDetector *detector, device_config_t *config,
+                              AlarmControl *alarm);
 
 #ifdef __cplusplus
 }

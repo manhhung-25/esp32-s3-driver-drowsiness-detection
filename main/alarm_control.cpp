@@ -21,16 +21,24 @@ static const char *TAG = "alarm_control";
 #define BUZZER_LEDC_TIMER   LEDC_TIMER_1
 
 static QueueHandle_t s_alarm_queue = NULL;
+static bool s_led_output = false;
+static bool s_buzzer_output = false;
+static volatile bool s_test_override = false;
+static volatile DrowsyState s_test_state = DrowsyState::AWAKE;
 
 // ---- LED: đơn giản on/off ----
 static void led_set(bool on)
 {
+    if (on == s_led_output) return;
+    s_led_output = on;
     gpio_set_level((gpio_num_t)CONFIG_DROWSY_LED_GPIO, on ? 1 : 0);
 }
 
 // ---- Buzzer: PWM qua LEDC ----
 static void buzzer_set(bool on)
 {
+    if (on == s_buzzer_output) return;
+    s_buzzer_output = on;
     if (on) {
         ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL, BUZZER_DUTY_MAX / 2); // 50%
         ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL);
@@ -41,7 +49,7 @@ static void buzzer_set(bool on)
 }
 
 // ---- Pattern state (không-blocking, tick 10ms) ----
-static void apply_pattern(DrowsyState state, uint32_t tick_ms)
+static void apply_pattern(DrowsyState state, uint32_t tick_ms, uint32_t state_elapsed_ms)
 {
     switch (state) {
     case DrowsyState::AWAKE:
@@ -59,13 +67,25 @@ static void apply_pattern(DrowsyState state, uint32_t tick_ms)
         // LED 2Hz (250ms on / 250ms off)
         led_set((tick_ms % 500) < 250);
         // Còi beep 500ms mỗi 2 giây
-        buzzer_set((tick_ms % 2000) < 500);
+        buzzer_set((tick_ms % 1000) < 150);
+        break;
+
+    case DrowsyState::DISTRACTED:
+        led_set((tick_ms % 1000) < 250);
+        buzzer_set((tick_ms % 2500) < 150);
         break;
 
     case DrowsyState::MICROSLEEP:
         // LED sáng liên tục + còi 200ms/200ms liên tục (rất to, đánh thức)
-        led_set(true);
-        buzzer_set((tick_ms % 400) < 200);
+        if (state_elapsed_ms >= 4000) {
+            led_set(true);
+            buzzer_set(true);
+        } else {
+            const uint32_t interval_ms = 1000 - (state_elapsed_ms * 800 / 4000);
+            const uint32_t on_ms = interval_ms > 140 ? 140 : interval_ms / 2;
+            led_set((tick_ms % interval_ms) < on_ms);
+            buzzer_set((tick_ms % interval_ms) < on_ms);
+        }
         break;
     }
 }
@@ -74,17 +94,29 @@ void AlarmControl::alarm_task(void *arg)
 {
     DrowsyState current = DrowsyState::AWAKE;
     uint32_t tick_ms = 0;
+    uint32_t state_elapsed_ms = 0;
     const TickType_t tick_period = pdMS_TO_TICKS(10); // tick 10ms
+    TickType_t last_wake = xTaskGetTickCount();
 
     while (true) {
         alarm_event_t ev;
-        // Nhận sự kiện mới (nếu có), không chặn để pattern chạy liên tục
-        if (xQueueReceive(s_alarm_queue, &ev, 0) == pdTRUE) {
-            current = ev.state;
+        if (s_test_override && s_test_state != current) {
+            current = s_test_state;
+            state_elapsed_ms = 0;
+            ESP_LOGI(TAG, "TEST alarm state=%d", (int)current);
         }
-        apply_pattern(current, tick_ms);
+        // Nhận sự kiện mới (nếu có), không chặn để pattern chạy liên tục
+        while (xQueueReceive(s_alarm_queue, &ev, 0) == pdTRUE) {
+            if (!s_test_override && ev.state != current) {
+                current = ev.state;
+                state_elapsed_ms = 0;
+                ESP_LOGI(TAG, "Alarm state=%d", (int)current);
+            }
+        }
+        apply_pattern(current, tick_ms, state_elapsed_ms);
         tick_ms += 10;
-        vTaskDelay(tick_period);
+        state_elapsed_ms += 10;
+        xTaskDelayUntil(&last_wake, tick_period);
     }
 }
 
@@ -97,7 +129,7 @@ QueueHandle_t AlarmControl::init()
     led_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     led_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     led_conf.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&led_conf);
+    ESP_ERROR_CHECK(gpio_config(&led_conf));
     led_set(false);
 
     // ---- Buzzer LEDC PWM ----
@@ -107,7 +139,7 @@ QueueHandle_t AlarmControl::init()
     timer_conf.duty_resolution = LEDC_TIMER_12_BIT;
     timer_conf.freq_hz = BUZZER_FREQ_HZ;
     timer_conf.clk_cfg = LEDC_AUTO_CLK;
-    ledc_timer_config(&timer_conf);
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
 
     ledc_channel_config_t ch_conf = {};
     ch_conf.speed_mode = LEDC_LOW_SPEED_MODE;
@@ -117,13 +149,31 @@ QueueHandle_t AlarmControl::init()
     ch_conf.gpio_num = CONFIG_DROWSY_BUZZER_GPIO;
     ch_conf.duty = 0;
     ch_conf.hpoint = 0;
-    ledc_channel_config(&ch_conf);
+    ESP_ERROR_CHECK(ledc_channel_config(&ch_conf));
     buzzer_set(false);
 
     // ---- Queue + task alarm (Core 1, cùng core AI để tránh đua queue) ----
     s_alarm_queue = xQueueCreate(ALARM_QUEUE_SIZE, sizeof(alarm_event_t));
-    xTaskCreatePinnedToCore(alarm_task, "alarm_task", 3 * 1024, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(alarm_task, "alarm_task", 3 * 1024, NULL, 4, NULL, 1);
 
     ESP_LOGI(TAG, "Alarm ready: LED=GPIO%d, Buzzer=GPIO%d", CONFIG_DROWSY_LED_GPIO, CONFIG_DROWSY_BUZZER_GPIO);
     return s_alarm_queue;
+}
+
+void AlarmControl::set_test_state(DrowsyState state)
+{
+    if (s_alarm_queue == NULL) {
+        ESP_LOGE(TAG, "Cannot test alarm before init");
+        return;
+    }
+    s_test_state = state;
+    s_test_override = true;
+    ESP_LOGI(TAG, "TEST alarm override enabled: state=%d", (int)state);
+}
+
+void AlarmControl::clear_test_state()
+{
+    s_test_override = false;
+    s_test_state = DrowsyState::AWAKE;
+    ESP_LOGI(TAG, "TEST alarm override disabled");
 }
