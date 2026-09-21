@@ -256,7 +256,7 @@ drowsy alarm off
 - Cần tập test nhiều người và benchmark A/B cùng video trên Raspberry Pi 5 nếu muốn công bố “accuracy tương đương”.
 - Khi dùng trên xe thật cần vỏ, nguồn ổn định, driver transistor cho buzzer lớn và đánh giá EMC/nhiệt/rung.
 
-## Nguồn và ghi công
+## Nguồn và tham khảo
 
 - **Giải pháp/repo gốc:** [phuongproduc — Driver Drowsiness Detection ESP32-S3](https://github.com/phuongproduc/Driver-Drowsiness-Detection-ESP32-S3-N16R8-ESP-WHO-ESP-DL-v3-PFLD-). Phiên bản này là phần phát triển tiếp theo và giữ liên kết nguồn để truy vết.
 - **ESP-DL:** [framework inference và quantization chính thức của Espressif](https://github.com/espressif/esp-dl).
